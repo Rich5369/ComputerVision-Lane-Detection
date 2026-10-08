@@ -1,0 +1,803 @@
+import argparse
+import time
+from pathlib import Path
+from tkinter import Tk, filedialog
+
+import cv2
+import numpy as np
+
+# --- Region of interest (fractions of frame width/height) -------------------
+ROI_TOP = 0.50  # The horizon sits at 0.47-0.50 in the sample footage; keep skyline out.
+ROI_BOTTOM = 0.76
+ROI_TOP_LEFT = 0.30
+ROI_TOP_RIGHT = 0.70
+ROI_BOTTOM_LEFT = 0.08
+ROI_BOTTOM_RIGHT = 0.92
+DRAW_BOTTOM = 0.72  # Lowest point lanes are drawn/fitted (just above the hood).
+SEED_TOP = 0.55
+DETECTION_WIDTH = 960
+
+# --- Paint detection ---------------------------------------------------------
+TOPHAT_KERNEL = 25  # px at DETECTION_WIDTH; bright shapes narrower than this count as paint.
+WHITE_CONTRAST = 22  # How much brighter than the nearby road white paint must be (0-255).
+WHITE_MIN_VALUE = 110  # HSV brightness; dim dusk paint is around 130-170.
+WHITE_MAX_SATURATION = 60  # HSV saturation; grass and tinted surfaces are higher.
+YELLOW_HUE = (8, 30)  # OpenCV hue units (0-179).
+YELLOW_MIN_SATURATION = 80
+YELLOW_MIN_VALUE = 110
+YELLOW_CONTRAST = 15
+NEIGHBOR_DISTANCE = 9  # px at DETECTION_WIDTH: how far left/right to compare against.
+ISOLATION_CONTRAST = 14  # White paint must beat the road on both sides by this much.
+MAX_STRIPE_WIDTH = 15 # px at DETECTION_WIDTH; thicker paint-colored shapes are not stripes.
+MAX_MASK_DENSITY = 0.12  # If this much of the ROI looks like paint, it is clutter, not a lane.
+
+# --- Searching along a lane --------------------------------------------------
+WINDOW_COUNT = 10
+WINDOW_MARGIN = 0.055  # Fraction of the detection frame width.
+MIN_WINDOW_PIXELS = 12
+MAX_WINDOW_PIXELS = 500  # Per 1280px width; dense blobs are not narrow stripes.
+MAX_SEED_SPAN = 0.18  # Reject lines that lean across too much of the road.
+HOUGH_VOTES = 18  # Paint pixels a straight seed needs (px at DETECTION_WIDTH).
+HOUGH_MIN_LENGTH = 18
+HOUGH_MAX_GAP = 60  # Wide enough to bridge the gap between dashes.
+HORIZON_Y = 0.49  # Where lanes converge; used to scale lane width with distance.
+
+# --- Geometric validation ----------------------------------------------------
+MAX_POINT_GAP = 0.14  # Largest vertical gap (fraction of height) the evidence may skip.
+NEAREST_EVIDENCE = 0.58  # Evidence must reach at least this far down the image.
+MIN_LANE_SLOPE = 0.2  # |dx/dy| in pixels: a lane may not be closer to vertical than this...
+MAX_LANE_SLOPE = 2.8  # ...or closer to horizontal than this.
+MAX_FIT_RMS = 0.012  # Typical distance of marking patches from the curve (fraction of width).
+OUTLIER_DISTANCE = 0.02
+MIN_FIT_CONFIDENCE = 0.45
+MAX_BEND = 0.08  # Quadratic bend limit; larger means an unrealistic curve.
+LANE_WIDTH_MIN = 0.14  # Left-to-right distance at DRAW_BOTTOM (fraction of frame width).
+LANE_WIDTH_MAX = 0.40
+LANE_WIDTH_TOLERANCE = 0.35  # Allowed change from the recently tracked lane width.
+
+# --- Tracking ----------------------------------------------------------------
+MAX_MISSING_FRAMES = 8  # How long a lane may be predicted without new evidence.
+MIN_DRAW_CONFIDENCE = 0.1
+SMOOTHING = 0.35
+CURVE_SMOOTHING = 0.5  # Curvature is smoothed this much more slowly than position.
+TOP_SMOOTHING = 0.2  # Slow smoothing keeps the far endpoint from jittering.
+MAX_FRAME_JUMP = 0.06  # Largest one-frame lane shift accepted (fraction of width).
+REACQUIRE_FRAMES = 5  # Frames a "jumped" lane must stay put before we believe it.
+CONFIRM_FRAMES = 3  # Consecutive detections before a brand-new lane is shown.
+ACQUIRE_CONFIDENCE = 0.6  # A new lane must score this well; an already-tracked one only needs MIN_FIT_CONFIDENCE.
+DASH_REFRESH_CONFIDENCE = 0.5  # Confidence when a tracked lane is re-anchored on a dash.
+DASH_REFRESH_MIN_SPAN = 0.03  # Vertical extent (fraction of height) of a usable dash.
+MAX_SHIFT_PER_FRAME = 0.02  # Cap when a predicted lane follows its partner sideways.
+
+_SAMPLE_Y = np.array([ROI_TOP, (ROI_TOP + DRAW_BOTTOM) / 2, DRAW_BOTTOM])  # Where two lane models are compared.
+
+LANE_COLOR = (255, 160, 0)
+LANE_OUTLINE = (20, 20, 20)
+SIDES = ("left", "right")
+
+
+def make_coordinates(image, line_parameters):
+    slope, intercept = line_parameters
+    y1 = int(image.shape[0] * DRAW_BOTTOM)
+    y2 = int(image.shape[0] * SEED_TOP)
+    x1 = int((y1 - intercept) / slope)
+    x2 = int((y2 - intercept) / slope)
+    return np.array([x1, y1, x2, y2])
+
+
+def find_lane_seeds(image, lines):
+    """Pick one straight Hough segment cluster per side as a starting guide."""
+    height, width = image.shape[:2]
+    fits = {"left": [], "right": []}
+    if lines is None:
+        return {}
+
+    for line in lines:
+        x1, y1, x2, y2 = line.reshape(4)
+        if x1 == x2:
+            continue
+
+        slope = (y2 - y1) / (x2 - x1)
+        if not 0.35 < abs(slope) < 5:
+            continue
+        intercept = y1 - slope * x1
+        bottom_x = (height * DRAW_BOTTOM - intercept) / slope
+        top_x = (height * SEED_TOP - intercept) / slope
+        length = np.hypot(x2 - x1, y2 - y1)
+
+        if (slope < 0 and 0.25 * width < bottom_x < 0.5 * width
+                and 0.3 * width < top_x < 0.55 * width
+                and top_x - bottom_x < MAX_SEED_SPAN * width):
+            fits["left"].append((bottom_x, slope, intercept, length))
+        elif (slope > 0 and 0.5 * width < bottom_x < 0.84 * width
+              and 0.45 * width < top_x < 0.7 * width
+              and bottom_x - top_x < MAX_SEED_SPAN * width):
+            fits["right"].append((bottom_x, slope, intercept, length))
+
+    selected_lines = {}
+    radius = width * 0.035
+    for side in SIDES:
+        candidates = fits[side]
+        if not candidates:
+            continue
+
+        supports = [
+            sum(other[3] for other in candidates if abs(other[0] - fit[0]) < radius)
+            for fit in candidates
+        ]
+        strongest = max(supports)
+        viable = [fit for fit, support in zip(candidates, supports) if support >= 0.6 * strongest]
+        best = min(
+            viable,
+            key=lambda fit: abs(fit[0] - width / 2),
+        )
+        cluster = [fit for fit in candidates if abs(fit[0] - best[0]) < radius]
+        parameters = np.average(
+            [(fit[1], fit[2]) for fit in cluster],
+            axis=0,
+            weights=[fit[3] for fit in cluster],
+        )
+        selected_lines[side] = make_coordinates(image, parameters)
+
+    if "left" in selected_lines and "right" in selected_lines:
+        left, right = selected_lines["left"], selected_lines["right"]
+        if left[2] >= right[2]:
+            wrong_side = max(
+                SIDES,
+                key=lambda candidate_side: abs(selected_lines[candidate_side][2] - width / 2),
+            )
+            del selected_lines[wrong_side]
+
+    return selected_lines
+
+
+def roi_polygon(width, height):
+    return np.array([
+        [
+            (int(width * ROI_BOTTOM_LEFT), int(height * ROI_BOTTOM)),
+            (int(width * ROI_BOTTOM_RIGHT), int(height * ROI_BOTTOM)),
+            (int(width * ROI_TOP_RIGHT), int(height * ROI_TOP)),
+            (int(width * ROI_TOP_LEFT), int(height * ROI_TOP)),
+        ]
+    ], dtype=np.int32)
+
+
+def region_of_interest(image):
+    height, width = image.shape[:2]
+    mask = np.zeros_like(image)
+    cv2.fillPoly(mask, roi_polygon(width, height), 255)
+    return cv2.bitwise_and(image, mask)
+
+
+def line_model(line, width, height):
+    """Convert a Hough seed to x/width = a*y/height + b."""
+    x_bottom, y_bottom, x_top, y_top = line
+    slope = ((x_bottom - x_top) / width) / ((y_bottom - y_top) / height)
+    return np.array([0.0, slope, x_bottom / width - slope * y_bottom / height])
+
+
+def lane_color_mask(frame):
+    """Mark pixels that look like narrow white or yellow road paint.
+
+    White is judged against the road around it (a morphological top-hat), not
+    against a fixed brightness, so dim dusk paint still counts while large
+    bright things such as cars, sky and concrete do not.
+    """
+    height, width = frame.shape[:2]
+    top, bottom = int(height * ROI_TOP), int(height * ROI_BOTTOM) + 1
+    hsv = cv2.cvtColor(np.ascontiguousarray(frame[top:bottom]), cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+
+    scale = width / DETECTION_WIDTH
+    size = max(9, round(TOPHAT_KERNEL * scale)) | 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    contrast = cv2.morphologyEx(value, cv2.MORPH_TOPHAT, kernel)
+
+    # Real paint has darker road on BOTH sides. A curb lip or gutter edge is
+    # bright against asphalt on one side but concrete (equally bright) on the other.
+    smooth = cv2.GaussianBlur(value, (3, 3), 0).astype(np.int16)
+    reach = max(3, round(NEIGHBOR_DISTANCE * scale))
+    brighter_than_both = smooth - np.maximum(np.roll(smooth, reach, axis=1), np.roll(smooth, -reach, axis=1))
+
+    white = ((contrast > WHITE_CONTRAST) & (value > WHITE_MIN_VALUE) & (saturation < WHITE_MAX_SATURATION)
+             & (brighter_than_both > ISOLATION_CONTRAST))
+    yellow = (
+        (hue >= YELLOW_HUE[0]) & (hue <= YELLOW_HUE[1])
+        & (saturation >= YELLOW_MIN_SATURATION) & (value >= YELLOW_MIN_VALUE)
+        & (contrast > YELLOW_CONTRAST)
+    )
+    paint = np.zeros((height, width), dtype=np.uint8)
+    paint[top:bottom] = (white | yellow).astype(np.uint8) * 255
+    paint = region_of_interest(paint)
+
+    # Cars, crosswalk bars and pale concrete are thick; stripes are thin. Erase
+    # anything thicker than a stripe so only line-like paint remains.
+    thick_size = max(5, round(MAX_STRIPE_WIDTH * scale)) | 1
+    thick_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thick_size, thick_size))
+    core = cv2.erode(paint, thick_kernel)
+    if core.any():
+        grown = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thick_size + 8, thick_size + 8)))
+        paint[grown > 0] = 0
+    return paint
+
+
+def collect_lane_points(mask, guide):
+    """Follow a guide upward and keep the center of each narrow marking patch."""
+    height, width = mask.shape[:2]
+    pixel_y, pixel_x = np.nonzero(mask)
+    window_height = (DRAW_BOTTOM - ROI_TOP) / WINDOW_COUNT
+    margin = WINDOW_MARGIN * width
+    offset = 0.0
+    points = []
+
+    for index in range(WINDOW_COUNT):
+        top = DRAW_BOTTOM - (index + 1) * window_height
+        bottom = top + window_height
+        middle = (top + bottom) / 2
+        predicted_x = np.polyval(guide, middle) * width + offset
+        inside = (
+            (pixel_y >= top * height) & (pixel_y < bottom * height)
+            & (np.abs(pixel_x - predicted_x) < margin)
+        )
+        nearby_x = pixel_x[inside]
+        if nearby_x.size < MIN_WINDOW_PIXELS:
+            continue
+        # Broad blobs are usually cars or sidewalks, not a narrow lane stripe.
+        if nearby_x.size > MAX_WINDOW_PIXELS * (width / 1280) ** 2:
+            continue
+        if np.percentile(nearby_x, 75) - np.percentile(nearby_x, 25) > margin * 0.9:
+            continue
+        observed_x = float(np.median(nearby_x))
+        observed_y = float(np.median(pixel_y[inside]))
+        points.append((observed_y / height, observed_x / width, min(nearby_x.size, 100)))
+        offset = 0.65 * (observed_x - np.polyval(guide, middle) * width)
+    return points
+
+
+def contiguous_from_bottom(points):
+    """Keep only evidence that is continuous upward from the nearest patch.
+
+    A lane may skip a dash, but a long empty stretch means whatever lies beyond
+    it is unrelated (or an intersection), so it must not stretch the lane.
+    """
+    ordered = sorted(points, key=lambda point: -point[0])
+    run = []
+    for point in ordered:
+        if run and run[-1][0] - point[0] > MAX_POINT_GAP:
+            break
+        run.append(point)
+    return run
+
+
+def fit_lane_curve(mask, side, guide, points=None, notes=None):
+    """Fit a straight or quadratic boundary through observed marking patches.
+
+    Returns (model, top, confidence) or None. When `notes` is a dict, the reason
+    for a rejection is stored in notes[side] for the debug view.
+    """
+    def reject(reason):
+        if notes is not None:
+            notes[side] = reason
+        return None
+
+    height, width = mask.shape[:2]
+    aspect = width / height
+    if points is None:
+        points = collect_lane_points(mask, guide)
+    points = contiguous_from_bottom(points)
+
+    if len(points) < 3:
+        return reject("too few marking patches")
+    if max(point[0] for point in points) - min(point[0] for point in points) < 0.09:
+        return reject("evidence too short")
+    if points[0][0] < NEAREST_EVIDENCE:
+        return reject("no evidence near the car")
+
+    y_values = np.array([point[0] for point in points])
+    x_values = np.array([point[1] for point in points])
+    weights = np.sqrt([point[2] for point in points])
+    straight = np.polyfit(y_values, x_values, 1, w=weights)
+
+    # Drop patches far from the first straight estimate (a stray blob), refit once.
+    residual = np.abs(x_values - np.polyval(straight, y_values))
+    inliers = residual <= OUTLIER_DISTANCE
+    if 3 <= inliers.sum() < len(points):
+        y_values, x_values, weights = y_values[inliers], x_values[inliers], weights[inliers]
+        straight = np.polyfit(y_values, x_values, 1, w=weights)
+    if len(y_values) < 3 or np.ptp(y_values) < 0.09:
+        return reject("outliers removed too much evidence")
+    straight_model = np.array([0.0, *straight])
+
+    # A curve needs several separated observations and must explain the pixels
+    # substantially better than a straight line, or straight roads would wobble.
+    model = straight_model
+    if len(y_values) >= 5 and np.ptp(y_values) >= 0.16:
+        curved = np.polyfit(y_values, x_values, 2, w=weights)
+        straight_error = np.average((x_values - np.polyval(straight_model, y_values)) ** 2, weights=weights)
+        curved_error = np.average((x_values - np.polyval(curved, y_values)) ** 2, weights=weights)
+        bend = abs(curved[0]) * (DRAW_BOTTOM - ROI_TOP) ** 2 / 4
+        slopes = np.polyval(np.polyder(curved), [ROI_TOP, DRAW_BOTTOM])
+        bends_one_way = slopes[0] * slopes[1] > 0  # No hooks or S-shapes.
+        bottom_shift = abs(np.polyval(curved, DRAW_BOTTOM) - np.polyval(straight_model, DRAW_BOTTOM))
+        if (curved_error < straight_error * 0.75 and 0.004 < bend < MAX_BEND
+                and bends_one_way and bottom_shift < 0.03):
+            model = curved
+
+    rms = float(np.sqrt(np.average((x_values - np.polyval(model, y_values)) ** 2, weights=weights)))
+    if rms > MAX_FIT_RMS:
+        return reject(f"fit too loose ({rms:.3f})")
+
+    top_x, bottom_x = np.polyval(model, [ROI_TOP, DRAW_BOTTOM])
+    if side == "left":
+        valid = 0.2 < top_x < 0.64 and 0.12 < bottom_x < 0.52 and bottom_x < top_x - 0.015
+    else:
+        valid = 0.36 < top_x < 0.8 and 0.48 < bottom_x < 0.9 and bottom_x > top_x + 0.015
+    if not valid or abs(top_x - bottom_x) > 0.38:
+        return reject("outside the road area")
+    if abs(bottom_x - np.polyval(guide, DRAW_BOTTOM)) > 0.04:
+        return reject("drifted from guide")
+
+    # Orientation in pixels at the middle of the evidence: left lanes lean
+    # right going up, right lanes lean left, and neither may be near-flat/vertical.
+    middle_y = float(np.mean(y_values))
+    pixel_slope = np.polyval(np.polyder(model), middle_y) * aspect
+    if side == "left":
+        oriented = -MAX_LANE_SLOPE < pixel_slope < -MIN_LANE_SLOPE
+    else:
+        oriented = MIN_LANE_SLOPE < pixel_slope < MAX_LANE_SLOPE
+    if not oriented:
+        return reject(f"bad orientation ({pixel_slope:.2f})")
+
+    count_score = min(1.0, len(y_values) / 6)
+    span_score = min(1.0, float(np.ptp(y_values)) / 0.2)
+    fit_score = max(0.0, 1 - rms / MAX_FIT_RMS)
+    reach_score = float(np.clip(1 - (DRAW_BOTTOM - np.max(y_values)) / MAX_POINT_GAP, 0, 1))
+    confidence = 0.3 * count_score + 0.25 * span_score + 0.25 * fit_score + 0.2 * reach_score
+    if confidence < MIN_FIT_CONFIDENCE:
+        return reject(f"low confidence ({confidence:.2f})")
+    return model, float(np.min(y_values)), float(confidence)
+
+
+def refresh_from_dashes(points, model, top):
+    """Re-anchor a tracked lane on a dash or two without changing its shape.
+
+    One dash is too short to fit a line from scratch, but it can confirm that an
+    already-tracked lane is still where we think it is and nudge it sideways.
+    """
+    if len(points) < 2:
+        return None
+    y_values = np.array([point[0] for point in points])
+    offsets = np.array([point[1] for point in points]) - np.polyval(model, y_values)
+    if (y_values.max() < NEAREST_EVIDENCE - 0.02 or np.ptp(y_values) < DASH_REFRESH_MIN_SPAN
+            or np.ptp(offsets) > 0.012 or abs(np.median(offsets)) > 0.03):
+        return None
+    return model + np.array([0.0, 0.0, float(np.median(offsets))]), top, DASH_REFRESH_CONFIDENCE
+
+
+def validate_lane_pair(candidates, tracker, notes):
+    """Drop the weaker lane when the left/right pair is not a believable lane."""
+    if "left" not in candidates or "right" not in candidates:
+        return candidates
+
+    left, right = candidates["left"], candidates["right"]
+    width_bottom = np.polyval(right[0], DRAW_BOTTOM) - np.polyval(left[0], DRAW_BOTTOM)
+    shared_top = max(left[1], right[1])
+    sample_y = np.linspace(shared_top, DRAW_BOTTOM, 5)
+    gaps = np.polyval(right[0], sample_y) - np.polyval(left[0], sample_y)
+
+    problem = None
+    if not LANE_WIDTH_MIN <= width_bottom <= LANE_WIDTH_MAX:
+        problem = f"lane width {width_bottom:.2f}"
+    elif np.any(gaps <= 0.01):
+        problem = "lanes cross"
+    elif gaps[0] > gaps[-1] * 1.05:
+        problem = "lanes diverge into the distance"
+    elif (tracker.lane_width is not None
+          and abs(width_bottom - tracker.lane_width) > LANE_WIDTH_TOLERANCE * tracker.lane_width):
+        problem = f"lane width {width_bottom:.2f} vs tracked {tracker.lane_width:.2f}"
+    if problem is None:
+        return candidates
+
+    # Keep the lane with more support; prefer the one already being tracked.
+    def support(side):
+        tracked = side in tracker.models
+        return candidates[side][2] + (0.25 if tracked else 0.0)
+
+    weaker = min(SIDES, key=support)
+    notes[weaker] = f"pair rejected: {problem}"
+    return {side: value for side, value in candidates.items() if side != weaker}
+
+
+class LaneTracker:
+    """Track each lane independently: detected, predicted (held), or gone."""
+
+    def __init__(self):
+        self.models: dict[str, np.ndarray] = {}
+        self.tops: dict[str, float] = {}
+        self.missing: dict[str, int] = {}
+        self.confidence: dict[str, float] = {}
+        self.status: dict[str, str] = {}
+        self.lane_width = None
+        self.debug: dict = {}
+        self._peak: dict[str, float] = {}
+        self._pending: dict[str, tuple[np.ndarray, int]] = {}
+        self._candidate: dict[str, tuple[np.ndarray, int]] = {}
+
+    def fade(self, side):
+        """1.0 while a lane is detected; falls toward 0 as a held lane runs out of time."""
+        if self.status.get(side) == "detected":
+            return 1.0
+        return self.confidence[side] / max(self._peak[side], 1e-6)
+
+    def _forget(self, side):
+        for store in (self.models, self.tops, self.missing, self.confidence,
+                      self.status, self._peak, self._pending, self._candidate):
+            store.pop(side, None)
+
+    def _confirm(self, side, model, confidence):
+        """A brand-new lane is shown only after consecutive, consistent, strong detections."""
+        if confidence < ACQUIRE_CONFIDENCE:
+            self._candidate.pop(side, None)
+            return False
+        pending = self._candidate.get(side)
+        if pending is not None and np.max(np.abs(np.polyval(pending[0], _SAMPLE_Y) - np.polyval(model, _SAMPLE_Y))) <= MAX_FRAME_JUMP:
+            count = pending[1] + 1
+        else:
+            count = 1
+        self._candidate[side] = (model, count)
+        return count >= CONFIRM_FRAMES
+
+    def _enforce_pair(self):
+        """If the held/detected pair stops looking like one lane, drop the weaker side."""
+        if not all(side in self.models for side in SIDES):
+            return
+        sample_y = np.linspace(max(self.tops.values()), DRAW_BOTTOM, 5)
+        gaps = np.polyval(self.models["right"], sample_y) - np.polyval(self.models["left"], sample_y)
+        if LANE_WIDTH_MIN <= gaps[-1] <= LANE_WIDTH_MAX and np.all(gaps > 0.01):
+            return
+        predicted = [side for side in SIDES if self.status[side] == "predicted"]
+        weaker = predicted[0] if len(predicted) == 1 else min(SIDES, key=lambda side: self.confidence[side])
+        self._forget(weaker)
+
+    def _accept_jump(self, side, model):
+        """A big shift is believed only after it repeats consistently."""
+        pending = self._pending.get(side)
+        if pending is not None and np.max(np.abs(np.polyval(pending[0], _SAMPLE_Y) - np.polyval(model, _SAMPLE_Y))) < 0.04:
+            count = pending[1] + 1
+        else:
+            count = 1
+        self._pending[side] = (np.asarray(model), count)
+        return count >= REACQUIRE_FRAMES
+
+    def update(self, detections):
+        bottoms_before = {side: np.polyval(model, DRAW_BOTTOM) for side, model in self.models.items()}
+        detected = set()
+
+        for side in SIDES:
+            result = detections.get(side)
+            model, top, confidence = result if result is not None else (None, None, 0.0)
+            previous = self.models.get(side)
+            reacquired = False
+
+            if model is not None and previous is not None:
+                shift = np.max(np.abs(np.polyval(model, _SAMPLE_Y) - np.polyval(previous, _SAMPLE_Y)))
+                if shift > MAX_FRAME_JUMP:
+                    # Discard one-frame jumps from passing cars or road edges,
+                    # unless the new position persists (a real lane change).
+                    if self._accept_jump(side, model):
+                        self._forget(side)
+                        previous = None
+                        reacquired = True
+                    else:
+                        model = None
+                else:
+                    self._pending.pop(side, None)
+
+            if model is not None and previous is None and not reacquired:
+                if not self._confirm(side, np.asarray(model, dtype=float), confidence):
+                    continue
+            elif model is None and previous is None:
+                self._candidate.pop(side, None)
+
+            if model is None:
+                if previous is not None:
+                    self.missing[side] += 1
+                    if self.missing[side] > MAX_MISSING_FRAMES:
+                        self._forget(side)
+                    else:
+                        fade = 1 - self.missing[side] / (MAX_MISSING_FRAMES + 1)
+                        self.confidence[side] = self._peak[side] * fade
+                        self.status[side] = "predicted"
+                continue
+
+            model = np.asarray(model, dtype=float)
+            alpha = SMOOTHING * (0.5 + 0.5 * confidence)
+            if previous is None:
+                self.models[side] = model
+                self.tops[side] = top
+                self._peak[side] = confidence
+            else:
+                self.models[side] = blend_models(previous, model, alpha)
+                self.tops[side] = (1 - TOP_SMOOTHING) * self.tops[side] + TOP_SMOOTHING * top
+                self._peak[side] = 0.5 * self._peak[side] + 0.5 * confidence
+            self.missing[side] = 0
+            self.confidence[side] = self._peak[side]
+            self.status[side] = "detected"
+            detected.add(side)
+
+        # A held lane follows its partner when the car drifts sideways.
+        for side in SIDES:
+            partner = "right" if side == "left" else "left"
+            if (self.status.get(side) == "predicted" and partner in detected
+                    and partner in bottoms_before):
+                moved = np.polyval(self.models[partner], DRAW_BOTTOM) - bottoms_before[partner]
+                self.models[side] = self.models[side] + np.array(
+                    [0.0, 0.0, float(np.clip(moved, -MAX_SHIFT_PER_FRAME, MAX_SHIFT_PER_FRAME))]
+                )
+
+        self._enforce_pair()
+        if "left" in detected and "right" in detected and all(side in self.models for side in SIDES):
+            width = np.polyval(self.models["right"], DRAW_BOTTOM) - np.polyval(self.models["left"], DRAW_BOTTOM)
+            self.lane_width = width if self.lane_width is None else 0.9 * self.lane_width + 0.1 * width
+
+
+def blend_models(previous, new, alpha):
+    """Smooth position at alpha and curvature more slowly, keeping a clean parabola.
+
+    The curve is anchored through the smoothed positions at the middle and
+    bottom of the lane; only the bend (coefficient a) gets extra damping.
+    """
+    middle = (ROI_TOP + DRAW_BOTTOM) / 2
+    smoothed = {
+        y: (1 - alpha) * np.polyval(previous, y) + alpha * np.polyval(new, y)
+        for y in (middle, DRAW_BOTTOM)
+    }
+    curve_alpha = alpha * CURVE_SMOOTHING
+    a = (1 - curve_alpha) * previous[0] + curve_alpha * new[0]
+    b = (smoothed[DRAW_BOTTOM] - smoothed[middle] - a * (DRAW_BOTTOM ** 2 - middle ** 2)) / (DRAW_BOTTOM - middle)
+    c = smoothed[DRAW_BOTTOM] - a * DRAW_BOTTOM ** 2 - b * DRAW_BOTTOM
+    return np.array([a, b, c])
+
+
+def partner_guide(partner_model, lane_width, side):
+    """Expected position of a lane from its neighbour; width shrinks toward the horizon."""
+    # x_side(y) = x_partner(y) + direction * k * (y - HORIZON_Y), zero width at the horizon.
+    k = lane_width / (DRAW_BOTTOM - HORIZON_Y)
+    direction = -1 if side == "left" else 1
+    a, b, c = partner_model
+    return np.array([a, b + direction * k, c - direction * k * HORIZON_Y])
+
+
+def detect_lanes(frame, tracker):
+    height, width = frame.shape[:2]
+    mask = np.asarray(lane_color_mask(frame))
+    roi_area = cv2.contourArea(roi_polygon(width, height))
+    density = np.count_nonzero(mask) / roi_area
+    notes: dict[str, str] = {}
+    debug = {"size": (width, height), "mask": mask, "seeds": {}, "points": {},
+             "candidates": {}, "notes": notes, "density": density}
+    tracker.debug = debug
+
+    if density > MAX_MASK_DENSITY:
+        notes["frame"] = f"marking clutter ({density:.2f})"
+        return {}
+
+    scale = width / DETECTION_WIDTH
+    segments = cv2.HoughLinesP(
+        mask, 2, np.pi / 180, max(10, round(HOUGH_VOTES * scale)), np.array([]),
+        minLineLength=max(10, round(HOUGH_MIN_LENGTH * scale)), maxLineGap=max(5, round(HOUGH_MAX_GAP * scale)),
+    )
+    seeds = find_lane_seeds(frame, segments)
+    debug["seeds"] = {side: seed / np.array([width, height, width, height]) for side, seed in seeds.items()}
+
+    candidates = {}
+    for side in SIDES:
+        seed = seeds.get(side)
+        previous = tracker.models.get(side)
+        seed_model = line_model(seed, width, height) if seed is not None else None
+        guides = []
+        if previous is not None:
+            guides.append(previous)
+        if seed_model is not None:
+            if previous is None or abs(np.polyval(seed_model, DRAW_BOTTOM) - np.polyval(previous, DRAW_BOTTOM)) > 0.1:
+                guides.insert(0, seed_model)
+            else:
+                guides.append(seed_model)  # Second chance if the tracked guide finds nothing.
+        partner = "right" if side == "left" else "left"
+        if not guides and partner in tracker.models and tracker.lane_width is not None:
+            # No seed here, but the other lane and the usual lane width say where to look.
+            # This only steers the search; a line still needs real paint evidence.
+            guides.append(partner_guide(tracker.models[partner], tracker.lane_width, side))
+        if not guides:
+            notes[side] = "no guide"
+            continue
+
+        for guide in guides:
+            points = collect_lane_points(mask, guide)
+            debug["points"][side] = points
+            curve = fit_lane_curve(mask, side, guide, points, notes)
+            if curve is not None:
+                notes.pop(side, None)
+                candidates[side] = curve
+                break
+
+        if side not in candidates and previous is not None:
+            points = collect_lane_points(mask, previous)
+            refreshed = refresh_from_dashes(points, previous, tracker.tops[side])
+            if refreshed is not None:
+                debug["points"][side] = points
+                notes.pop(side, None)
+                candidates[side] = refreshed
+
+    candidates = validate_lane_pair(candidates, tracker, notes)
+    debug["candidates"] = candidates
+    return candidates
+
+
+def lane_opacity(tracker, side):
+    """Detected lanes are solid; held lanes fade with their remaining confidence."""
+    if tracker.status.get(side) == "detected":
+        return 1.0
+    return 0.3 + 0.7 * tracker.fade(side)
+
+
+def lane_points(tracker, side, width, height):
+    """Pixel polyline for a lane; held lanes are drawn shorter as they fade."""
+    top = tracker.tops[side]
+    if tracker.status.get(side) != "detected":
+        top = DRAW_BOTTOM - (DRAW_BOTTOM - top) * (0.4 + 0.6 * tracker.fade(side))
+    y = np.linspace(top, DRAW_BOTTOM, 40)
+    x = np.polyval(tracker.models[side], y)
+    return np.column_stack((x * width, y * height)).astype(np.int32).reshape(-1, 1, 2)
+
+
+def draw_lanes(frame, tracker):
+    output = frame.copy()
+    height, width = frame.shape[:2]
+    scale = width / 1280
+    for side in SIDES:
+        if side not in tracker.models or tracker.confidence[side] < MIN_DRAW_CONFIDENCE:
+            continue
+        points = lane_points(tracker, side, width, height)
+        opacity = lane_opacity(tracker, side)
+        layer = output if opacity >= 0.99 else output.copy()
+        cv2.polylines(layer, [points], False, LANE_OUTLINE, max(2, round(12 * scale)), cv2.LINE_AA)
+        cv2.polylines(layer, [points], False, LANE_COLOR, max(2, round(7 * scale)), cv2.LINE_AA)
+        if layer is not output:
+            cv2.addWeighted(layer, opacity, output, 1 - opacity, 0, output)
+    return output
+
+
+def draw_debug(frame, tracker):
+    """Separate diagnostic view; never mixed into the clean output."""
+    output = frame.copy()
+    info = tracker.debug
+    if not info:
+        return output
+    height, width = frame.shape[:2]
+    scale = width / 1280
+
+    paint = cv2.resize(info["mask"], (width, height), interpolation=cv2.INTER_NEAREST) > 0
+    output[paint] = (0.3 * output[paint] + 0.7 * np.array((0, 220, 0))).astype(np.uint8)
+    cv2.polylines(output, roi_polygon(width, height), True, (0, 255, 255), max(1, round(2 * scale)))
+
+    for seed in info["seeds"].values():
+        x1, y1, x2, y2 = (seed * np.array([width, height, width, height])).astype(int)
+        cv2.line(output, (x1, y1), (x2, y2), (255, 255, 255), max(1, round(2 * scale)), cv2.LINE_AA)
+    for points in info["points"].values():
+        for y, x, _ in points:
+            cv2.circle(output, (int(x * width), int(y * height)), max(3, round(6 * scale)), (0, 0, 255), -1)
+
+    for side, (model, top, _) in info["candidates"].items():
+        y = np.linspace(top, DRAW_BOTTOM, 30)
+        curve = np.column_stack((np.polyval(model, y) * width, y * height)).astype(np.int32)
+        cv2.polylines(output, [curve.reshape(-1, 1, 2)], False, (255, 0, 255), max(1, round(3 * scale)), cv2.LINE_AA)
+
+    status_colors = {"detected": (0, 255, 0), "predicted": (0, 165, 255)}
+    font_scale = 0.9 * scale
+    lines = []
+    for side in SIDES:
+        if side in tracker.models:
+            status = tracker.status[side]
+            text = f"{side.upper()}: {status.upper()} conf {tracker.confidence[side]:.2f}"
+            if status == "predicted":
+                text += f" ({tracker.missing[side]}/{MAX_MISSING_FRAMES})"
+            lines.append((text, status_colors[status]))
+            y = np.linspace(tracker.tops[side], DRAW_BOTTOM, 30)
+            curve = np.column_stack((np.polyval(tracker.models[side], y) * width, y * height)).astype(np.int32)
+            cv2.polylines(output, [curve.reshape(-1, 1, 2)], False, status_colors[status], max(2, round(4 * scale)), cv2.LINE_AA)
+        else:
+            reason = info["notes"].get(side, "no evidence")
+            lines.append((f"{side.upper()}: NONE - {reason}", (0, 0, 255)))
+    lines.append((f"paint density {info['density']:.3f}"
+                  + (f" - {info['notes']['frame']}" if "frame" in info["notes"] else ""), (255, 255, 255)))
+    for index, (text, color) in enumerate(lines):
+        position = (int(20 * scale), int((40 + 40 * index) * scale))
+        cv2.putText(output, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), max(3, round(5 * scale)), cv2.LINE_AA)
+        cv2.putText(output, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, max(1, round(2 * scale)), cv2.LINE_AA)
+    return output
+
+
+def process_frame(frame, tracker=None):
+    if tracker is None:
+        tracker = LaneTracker()
+    height, width = frame.shape[:2]
+    working_frame = (
+        np.asarray(cv2.resize(frame, (DETECTION_WIDTH, round(height * DETECTION_WIDTH / width))))
+        if width > DETECTION_WIDTH else frame
+    )
+    tracker.update(detect_lanes(working_frame, tracker))
+    # Models use fractions of width/height, so drawing restores original coordinates.
+    return draw_lanes(frame, tracker)
+
+
+def choose_video():
+    root = Tk()
+    root.withdraw()
+    try:
+        return filedialog.askopenfilename(
+            title="Select a driving video",
+            filetypes=[("Videos", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")],
+        )
+    finally:
+        root.destroy()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Draw detected lane lines on a driving video.")
+    parser.add_argument("video", nargs="?", help="Path to a video; opens a file picker if omitted")
+    parser.add_argument("--camera", type=int, help="Camera number, usually 0")
+    parser.add_argument("--debug", action="store_true",
+                        help="Also show a separate window with ROI, paint pixels, fits and confidence")
+    args = parser.parse_args()
+
+    if args.camera is not None and args.video is not None:
+        parser.error("Provide a video path or --camera, not both")
+
+    default_video = Path(__file__).with_name("test_driving_video.mp4")
+    source = (
+        args.camera if args.camera is not None
+        else args.video or (str(default_video) if default_video.is_file() else choose_video())
+    )
+    if not source:
+        print("No video selected.")
+        return
+
+    if isinstance(source, str) and not Path(source).is_file():
+        raise FileNotFoundError(f"Could not find video: {source}")
+
+    capture = cv2.VideoCapture(source)
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video source: {source}")
+
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    frame_interval = 1 / fps if fps > 0 else 1 / 30
+    tracker = LaneTracker()
+    window_name = "Lane detection - Q or Esc to quit"
+    debug_name = "Lane debug"
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1280, 720)
+        if args.debug:
+            cv2.namedWindow(debug_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(debug_name, 1280, 720)
+        while True:
+            frame_start = time.perf_counter()
+            success, frame = capture.read()
+            if not success:
+                break
+
+            frame = np.asarray(frame)
+            cv2.imshow(window_name, process_frame(frame, tracker))
+            if args.debug:
+                cv2.imshow(debug_name, draw_debug(frame, tracker))
+            delay = max(1, round((frame_interval - (time.perf_counter() - frame_start)) * 1000))
+            if cv2.waitKey(delay) & 0xFF in (ord("q"), 27):
+                break
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
