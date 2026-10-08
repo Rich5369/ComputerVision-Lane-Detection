@@ -233,6 +233,112 @@ class LaneDetectionTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(mask[285:405, 495:565]), 100)
         self.assertEqual(np.count_nonzero(mask[310:390, 660:840]), 0)
 
+    def test_paint_segments_keep_dash_gaps_and_merge_solid_chips(self):
+        height, width = 540, 960
+        model = np.array([0.0, 0.0, 0.5])  # A vertical lane at x = 0.5 keeps the test simple.
+        x = width // 2
+
+        dashed = np.zeros((height, width), dtype=np.uint8)
+        for start in (275, 315, 355):  # 20 px dashes separated by 20 px of bare asphalt.
+            dashed[start:start + 20, x - 2:x + 3] = 255
+        runs = lanes.paint_segments(dashed, model, 0.5)
+        self.assertEqual(len(runs), 3)
+        for (y0, y1), start in zip(runs, (275, 315, 355)):
+            self.assertAlmostEqual(y0 * height, start, delta=4)
+            self.assertAlmostEqual(y1 * height, start + 20, delta=4)
+
+        solid = np.zeros((height, width), dtype=np.uint8)
+        solid[275:385, x - 2:x + 3] = 255
+        solid[320:323, :] = 0  # A 3 px chip in the paint is not a dash gap.
+        self.assertEqual(len(lanes.paint_segments(solid, model, 0.5)), 1)
+
+        self.assertEqual(lanes.paint_segments(np.zeros((height, width), dtype=np.uint8), model, 0.5), [])
+
+    def test_blob_filter_removes_squat_and_horizontal_shapes_but_keeps_stripes(self):
+        paint = np.zeros((540, 960), dtype=np.uint8)
+        cv2.line(paint, (400, 500), (440, 400), 255, 5)  # Steep stripe.
+        cv2.rectangle(paint, (600, 400), (640, 420), 255, -1)  # Squat blob (taillight/plate).
+        cv2.rectangle(paint, (100, 400), (300, 408), 255, -1)  # Horizontal bar (stop line/bumper).
+        kept = lanes.remove_non_stripe_blobs(paint)
+        self.assertGreater(np.count_nonzero(kept[390:510, 395:445]), 100)
+        self.assertEqual(np.count_nonzero(kept[395:425, 595:645]), 0)
+        self.assertEqual(np.count_nonzero(kept[395:410, 95:305]), 0)
+
+    def test_dash_candidate_needs_two_aligned_patches_near_the_car(self):
+        seed = LEFT
+        good = [(0.68, np.polyval(seed, 0.68), 50), (0.65, np.polyval(seed, 0.65), 50), (0.62, np.polyval(seed, 0.62), 50)]
+        model, top, confidence = lanes.fit_dash_candidate(good, "left", seed)
+        self.assertAlmostEqual(top, 0.62)
+        self.assertLess(confidence, 1.0)
+        self.assertIsNone(lanes.fit_dash_candidate(good[:1], "left", seed))  # One patch is not a dash.
+        self.assertIsNone(lanes.fit_dash_candidate(good, "right", seed))  # Wrong side of the car.
+        far = [(0.56, 0.5, 50), (0.54, 0.5, 50)]
+        self.assertIsNone(lanes.fit_dash_candidate(far, "left", seed))  # Nowhere near the car.
+
+    def test_drawn_lane_follows_measured_paint_segments(self):
+        tracker = lanes.LaneTracker()
+        confirm(tracker, left=LEFT)
+        frame = np.full((720, 1280, 3), 90, dtype=np.uint8)
+        tracker.segments = {"left": [(0.60, 0.64), (0.69, 0.72)]}
+        drawn = lanes.draw_lanes(frame, tracker)
+        gap_x = int(np.polyval(LEFT, 0.665) * 1280)
+        self.assertTrue(np.array_equal(drawn[int(0.665 * 720), gap_x], frame[0, 0]))  # The gap stays bare.
+        tracker.segments = {"left": []}  # Nothing visible this frame: draw nothing.
+        np.testing.assert_array_equal(lanes.draw_lanes(frame, tracker), frame)
+
+    def test_lone_boundary_cannot_jump_sideways_without_a_partner(self):
+        tracker = lanes.LaneTracker()
+        confirm(tracker, right=RIGHT)
+        before = tracker.models["right"].copy()
+        curb = RIGHT + np.array([0.0, 0.0, 0.09])  # A neighbouring edge, persistently present.
+        for _ in range(lanes.REACQUIRE_FRAMES + 2):
+            tracker.update({"right": (curb, lanes.SEED_TOP, 1)})
+        np.testing.assert_array_equal(tracker.models["right"], before)
+
+    def test_lost_lane_is_not_replaced_far_away_for_a_while(self):
+        tracker = lanes.LaneTracker()
+        confirm(tracker, right=RIGHT)
+        for _ in range(lanes.MAX_MISSING_FRAMES + 1):
+            tracker.update({})
+        self.assertNotIn("right", tracker.models)
+        curb = RIGHT + np.array([0.0, 0.0, 0.12])
+        for _ in range(lanes.CONFIRM_FRAMES + 2):
+            tracker.update({"right": (curb, lanes.SEED_TOP, 1)})
+        self.assertNotIn("right", tracker.models)  # Too far from where the lane was lost.
+        for _ in range(lanes.CONFIRM_FRAMES):
+            tracker.update({"right": (RIGHT, lanes.SEED_TOP, 1)})
+        self.assertIn("right", tracker.models)  # Back where it was: accepted.
+
+    def test_dashed_lanes_are_held_longer_than_solid_ones(self):
+        tracker = lanes.LaneTracker()
+        confirm(tracker, left=LEFT)
+        self.assertEqual(tracker.limit("left"), lanes.MAX_MISSING_FRAMES)
+        tracker.dashed["left"] = True
+        self.assertEqual(tracker.limit("left"), lanes.MAX_MISSING_FRAMES_DASHED)
+
+    def test_paint_contrast_separates_paint_on_asphalt_from_a_curb_edge(self):
+        height, width = 540, 960
+        runs = [(0.56, 0.70)]
+        model = np.array([0.0, 0.0, 0.5])
+
+        paint = np.full((height, width, 3), 80, dtype=np.uint8)  # Asphalt both sides.
+        paint[:, 478:483] = 170
+        paint_contrast = lanes.paint_contrast(lanes.smoothed_value(paint), model, runs)
+
+        curb = np.full((height, width, 3), 80, dtype=np.uint8)  # Asphalt on one side, bright concrete on the other.
+        curb[:, 478:] = 160
+        curb_contrast = lanes.paint_contrast(lanes.smoothed_value(curb), model, runs)
+
+        self.assertGreater(paint_contrast, lanes.MIN_PAINT_CONTRAST)
+        self.assertLess(curb_contrast, lanes.MIN_PAINT_CONTRAST_TRACKED)
+        self.assertIsNone(lanes.paint_contrast(lanes.smoothed_value(paint), model, []))  # Nothing to measure.
+
+    def test_curb_check_does_not_reject_a_real_painted_line(self):
+        frame = np.full((540, 960, 3), 80, dtype=np.uint8)
+        cv2.line(frame, (640, 389), (545, 270), (170, 170, 170), 5)  # Right boundary toward the horizon.
+        found = lanes.detect_lanes(frame, lanes.LaneTracker())
+        self.assertIn("right", found)
+
     def test_noise_does_not_create_lanes(self):
         rng = np.random.default_rng(1)
         tracker = lanes.LaneTracker()

@@ -30,6 +30,21 @@ NEIGHBOR_DISTANCE = 9  # px at DETECTION_WIDTH: how far left/right to compare ag
 ISOLATION_CONTRAST = 14  # White paint must beat the road on both sides by this much.
 MAX_STRIPE_WIDTH = 15 # px at DETECTION_WIDTH; thicker paint-colored shapes are not stripes.
 MAX_MASK_DENSITY = 0.12  # If this much of the ROI looks like paint, it is clutter, not a lane.
+MIN_BLOB_AREA = 12  # px at DETECTION_WIDTH; smaller specks are noise.
+MIN_BLOB_ELONGATION = 2.2  # Long side / short side; paint stripes are long and thin, car parts are squat.
+MIN_BLOB_ANGLE = 18  # Degrees from horizontal; flatter blobs are stop bars, bumpers or crosswalk bars.
+
+# --- Curb rejection ----------------------------------------------------------
+MIN_PAINT_CONTRAST = 24  # V levels (0-255): a new lane's paint must beat the road on both sides by this much.
+MIN_PAINT_CONTRAST_TRACKED = 16  # Lower for a lane already tracked, so it does not flap near the limit.
+CONTRAST_NEAR = 9  # px at DETECTION_WIDTH: road is sampled from this far from the line...
+CONTRAST_FAR = 16  # ...out to this far, on each side.
+
+# --- Dash / solid segmentation (what the overlay actually draws) ------------
+SEGMENT_BAND = 0.012  # Half-width (fraction of frame width) around the lane curve searched for paint.
+SEGMENT_MIN_LENGTH = 0.010  # Shortest painted run drawn (fraction of frame height).
+SEGMENT_MERGE_GAP = 0.012  # Gaps up to this (fraction of height) inside paint are treated as chips, not dash gaps.
+SEGMENT_PAD = 0.003  # Extend each run slightly so overlay ends sit on the paint edges.
 
 # --- Searching along a lane --------------------------------------------------
 WINDOW_COUNT = 10
@@ -57,22 +72,29 @@ LANE_WIDTH_TOLERANCE = 0.35  # Allowed change from the recently tracked lane wid
 
 # --- Tracking ----------------------------------------------------------------
 MAX_MISSING_FRAMES = 8  # How long a lane may be predicted without new evidence.
+DASHED_PAINTED_FRACTION = 0.7  # A lane with less paint than this along its length counts as dashed.
+MAX_MISSING_FRAMES_DASHED = 36  # Dashed lanes are legitimately unseen between dashes (~1 s); only visible paint is drawn.
 MIN_DRAW_CONFIDENCE = 0.1
 SMOOTHING = 0.35
 CURVE_SMOOTHING = 0.5  # Curvature is smoothed this much more slowly than position.
 TOP_SMOOTHING = 0.2  # Slow smoothing keeps the far endpoint from jittering.
 MAX_FRAME_JUMP = 0.06  # Largest one-frame lane shift accepted (fraction of width).
+RELOCK_FRAMES = 90  # After losing a lane, how long a far-away replacement is distrusted (~3 s).
+RELOCK_DISTANCE = 0.05  # How far (fraction of width) a lone replacement may sit from the lost lane.
 REACQUIRE_FRAMES = 5  # Frames a "jumped" lane must stay put before we believe it.
 CONFIRM_FRAMES = 3  # Consecutive detections before a brand-new lane is shown.
 ACQUIRE_CONFIDENCE = 0.6  # A new lane must score this well; an already-tracked one only needs MIN_FIT_CONFIDENCE.
 DASH_REFRESH_CONFIDENCE = 0.5  # Confidence when a tracked lane is re-anchored on a dash.
 DASH_REFRESH_MIN_SPAN = 0.03  # Vertical extent (fraction of height) of a usable dash.
+DASH_CANDIDATE_CONFIDENCE = 0.62  # Slightly above ACQUIRE_CONFIDENCE, but only used when both sides agree.
 MAX_SHIFT_PER_FRAME = 0.02  # Cap when a predicted lane follows its partner sideways.
 
 _SAMPLE_Y = np.array([ROI_TOP, (ROI_TOP + DRAW_BOTTOM) / 2, DRAW_BOTTOM])  # Where two lane models are compared.
 
 LANE_COLOR = (255, 160, 0)
 LANE_OUTLINE = (20, 20, 20)
+LINE_WIDTH = 4  # Overlay thickness in px at 1280 wide (scaled with the frame).
+OUTLINE_OPACITY = 0.35  # How strongly the dark edge shows (0 = none).
 SIDES = ("left", "right")
 
 
@@ -218,7 +240,76 @@ def lane_color_mask(frame):
     if core.any():
         grown = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thick_size + 8, thick_size + 8)))
         paint[grown > 0] = 0
-    return paint
+    return remove_non_stripe_blobs(paint)
+
+
+def remove_non_stripe_blobs(paint):
+    """Keep only connected paint blobs shaped like a lane stripe.
+
+    The color/contrast tests only ask "is this pixel bright?". Taillights, plates,
+    bumpers and stop bars pass that test, so we also look at each blob's SHAPE:
+    a lane stripe is long and thin and runs away from the camera (steep in the
+    image), while a car part is squat or horizontal. The shape comes from the
+    blob's second moments (a covariance ellipse), which is cheap and needs no
+    contour tracing.
+    """
+    scale = paint.shape[1] / DETECTION_WIDTH
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(paint, connectivity=8)
+    keep = np.zeros(count, dtype=bool)
+    for label in range(1, count):
+        x, y, w, h, area = stats[label]
+        if area < MIN_BLOB_AREA * scale ** 2:
+            continue
+        ys, xs = np.nonzero(labels[y:y + h, x:x + w] == label)
+        if xs.size < 3:
+            continue
+        covariance = np.cov(np.vstack((xs, ys)))
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        long_axis = eigenvectors[:, 1]
+        elongation = np.sqrt(max(eigenvalues[1], 1e-6) / max(eigenvalues[0], 1e-6))
+        angle_from_horizontal = np.degrees(np.arctan2(abs(long_axis[1]), abs(long_axis[0])))
+        keep[label] = elongation >= MIN_BLOB_ELONGATION and angle_from_horizontal >= MIN_BLOB_ANGLE
+    return np.where(keep[labels], 255, 0).astype(np.uint8)
+
+
+def paint_segments(mask, model, top, bottom=None):
+    """Find the painted runs along a lane curve: one run for solid paint, several for dashes.
+
+    Idea: walk down the lane curve row by row and ask "is there paint right on
+    the curve in this row?". That gives a 1-D on/off signal. Runs of "on" are
+    paint; runs of "off" are bare asphalt. Tiny "off" holes (chips in a solid
+    line) are filled; real dash gaps are longer and stay gaps.
+
+    Returns a list of (y_start, y_end) in fractions of frame height, top first.
+    """
+    bottom = DRAW_BOTTOM if bottom is None else bottom
+    height, width = mask.shape[:2]
+    rows = np.arange(int(top * height), int(bottom * height) + 1)
+    if rows.size == 0:
+        return []
+    curve_x = np.polyval(model, rows / height) * width
+    band = SEGMENT_BAND * width
+    on_curve = np.zeros(rows.size, dtype=bool)
+    for index, (row, x) in enumerate(zip(rows, curve_x)):
+        left, right = max(0, int(x - band)), min(width, int(x + band) + 1)
+        on_curve[index] = left < right and mask[min(row, height - 1), left:right].any()
+
+    # Run-length encode the on/off signal.
+    padded = np.concatenate(([False], on_curve, [False]))
+    changes = np.flatnonzero(padded[1:] != padded[:-1])
+    runs = [[rows[start], rows[end - 1]] for start, end in zip(changes[::2], changes[1::2])]
+
+    merged = []
+    for run in runs:
+        if merged and run[0] - merged[-1][1] <= SEGMENT_MERGE_GAP * height:
+            merged[-1][1] = run[1]
+        else:
+            merged.append(run)
+    pad = SEGMENT_PAD * height
+    return [
+        (max(top, (start - pad) / height), min(bottom, (end + pad) / height))
+        for start, end in merged if (end - start) >= SEGMENT_MIN_LENGTH * height
+    ]
 
 
 def collect_lane_points(mask, guide):
@@ -358,6 +449,73 @@ def fit_lane_curve(mask, side, guide, points=None, notes=None):
     return model, float(np.min(y_values)), float(confidence)
 
 
+def smoothed_value(frame):
+    """Brightness (HSV 'V') of the frame, lightly blurred so single noisy pixels don't count."""
+    blue, green, red = cv2.split(frame)
+    return cv2.GaussianBlur(cv2.max(cv2.max(blue, green), red), (5, 5), 0)
+
+
+def paint_contrast(value, model, runs):
+    """How much brighter the painted runs are than the road on their LEFT and RIGHT, or None if unmeasurable.
+
+    Real paint is a bright stripe on darker asphalt, so it beats the pixels on
+    both sides. A curb edge or sidewalk joint passes the paint-pixel tests but
+    is about as bright as the concrete next to it, so one side (or both) has
+    almost no contrast. The weaker side decides, so a line must stand out
+    everywhere. Distances are measured in pixels at DETECTION_WIDTH.
+    """
+    height, width = value.shape[:2]
+    scale = width / DETECTION_WIDTH
+    rows = np.concatenate([np.arange(int(start * height), int(end * height)) for start, end in runs]) if runs else []
+    if len(rows) == 0:
+        return None
+    rows = np.asarray(rows)
+    x = (np.polyval(model, rows / height) * width).astype(int)
+    peak_window = np.ones((1, max(3, round(13 * scale)) | 1), dtype=np.uint8)
+    peak = cv2.dilate(value, peak_window)  # Brightest pixel within a few px: tolerates small model error.
+    inside = (x > 0) & (x < width - 1)
+    rows, x = rows[inside], x[inside]
+    if len(rows) < 8:
+        return None
+    line = peak[rows, x].mean()
+    offsets = np.arange(round(CONTRAST_NEAR * scale), round(CONTRAST_FAR * scale), 2)
+    sides = []
+    for direction in (-1, 1):
+        columns = np.clip(x[:, None] + direction * offsets[None, :], 0, width - 1)
+        sides.append(value[rows[:, None], columns].mean())
+    return float(line - max(sides))
+
+
+def side_geometry_ok(side, model):
+    """Is this curve where a lane boundary on `side` of the car can plausibly be, and oriented like one?"""
+    top_x, bottom_x = np.polyval(model, [ROI_TOP, DRAW_BOTTOM])
+    if side == "left":
+        located = 0.2 < top_x < 0.64 and 0.12 < bottom_x < 0.52 and bottom_x < top_x - 0.015
+    else:
+        located = 0.36 < top_x < 0.8 and 0.48 < bottom_x < 0.9 and bottom_x > top_x + 0.015
+    return located and abs(top_x - bottom_x) <= 0.38
+
+
+def fit_dash_candidate(points, side, seed_model):
+    """Weak boundary evidence from one or two dashes, for lanes marked only by dashes.
+
+    A single dash is too short to fit a trustworthy curve, so this uses the
+    straight Hough seed and only checks that the dash's patches sit on it. The
+    result is flagged weaker than a normal fit, and detect_lanes only keeps it
+    when the opposite boundary is also found and the two form a believable lane.
+    """
+    points = contiguous_from_bottom(points)
+    if len(points) < 2:
+        return None
+    y_values = np.array([point[0] for point in points])
+    if np.ptp(y_values) < DASH_REFRESH_MIN_SPAN or y_values.max() < NEAREST_EVIDENCE:
+        return None
+    offsets = np.array([point[1] for point in points]) - np.polyval(seed_model, y_values)
+    if np.max(np.abs(offsets)) > 0.012 or not side_geometry_ok(side, seed_model):
+        return None
+    return seed_model, float(y_values.min()), DASH_CANDIDATE_CONFIDENCE
+
+
 def refresh_from_dashes(points, model, top):
     """Re-anchor a tracked lane on a dash or two without changing its shape.
 
@@ -419,9 +577,19 @@ class LaneTracker:
         self.status: dict[str, str] = {}
         self.lane_width = None
         self.debug: dict = {}
+        # Painted runs per side measured on the current frame: [(y_start, y_end), ...].
+        # A side with no entry was not measured, so drawing falls back to the whole curve.
+        self.segments: dict[str, list[tuple[float, float]]] = {}
+        self.frame = 0
+        self.last_seen: dict[str, tuple[float, int]] = {}  # side -> (bottom x, frame); survives _forget.
+        self.dashed: dict[str, bool] = {}  # Sticky: set once a lane is seen as separate dashes.
         self._peak: dict[str, float] = {}
         self._pending: dict[str, tuple[np.ndarray, int]] = {}
         self._candidate: dict[str, tuple[np.ndarray, int]] = {}
+
+    def limit(self, side):
+        """Frames a lane may go without evidence before it is dropped."""
+        return MAX_MISSING_FRAMES_DASHED if self.dashed.get(side) else MAX_MISSING_FRAMES
 
     def fade(self, side):
         """1.0 while a lane is detected; falls toward 0 as a held lane runs out of time."""
@@ -431,7 +599,7 @@ class LaneTracker:
 
     def _forget(self, side):
         for store in (self.models, self.tops, self.missing, self.confidence,
-                      self.status, self._peak, self._pending, self._candidate):
+                      self.status, self.dashed, self._peak, self._pending, self._candidate):
             store.pop(side, None)
 
     def _confirm(self, side, model, confidence):
@@ -459,6 +627,29 @@ class LaneTracker:
         weaker = predicted[0] if len(predicted) == 1 else min(SIDES, key=lambda side: self.confidence[side])
         self._forget(weaker)
 
+    def _width_plausible(self, side, model):
+        """Would `model` keep the lane about as wide as it has been, given the other boundary?"""
+        partner = self.models.get("right" if side == "left" else "left")
+        if partner is None or self.lane_width is None:
+            return True
+        gap = np.polyval(model, DRAW_BOTTOM) - np.polyval(partner, DRAW_BOTTOM)
+        width = gap if side == "right" else -gap
+        return abs(width - self.lane_width) <= LANE_WIDTH_TOLERANCE * self.lane_width
+
+    def _has_partner(self, side):
+        return ("right" if side == "left" else "left") in self.models
+
+    def _near_last_position(self, side, model):
+        """A lane lost moments ago may not reappear far away unless the other boundary is present.
+
+        Without this, a lane that fades at an intersection is replaced by whatever
+        straight edge (curb, sidewalk) shows up next. Real paint comes back where it was.
+        """
+        last = self.last_seen.get(side)
+        if last is None or self.frame - last[1] > RELOCK_FRAMES or self._has_partner(side):
+            return True
+        return abs(np.polyval(model, DRAW_BOTTOM) - last[0]) <= RELOCK_DISTANCE
+
     def _accept_jump(self, side, model):
         """A big shift is believed only after it repeats consistently."""
         pending = self._pending.get(side)
@@ -470,6 +661,7 @@ class LaneTracker:
         return count >= REACQUIRE_FRAMES
 
     def update(self, detections):
+        self.frame += 1
         bottoms_before = {side: np.polyval(model, DRAW_BOTTOM) for side, model in self.models.items()}
         detected = set()
 
@@ -484,7 +676,14 @@ class LaneTracker:
                 if shift > MAX_FRAME_JUMP:
                     # Discard one-frame jumps from passing cars or road edges,
                     # unless the new position persists (a real lane change).
-                    if self._accept_jump(side, model):
+                    if not self._has_partner(side) or not self._width_plausible(side, model):
+                        # A lone boundary that leaps sideways is more likely a curb or a
+                        # neighbouring lane than a lane change, and with no partner there is
+                        # nothing to check it against. A partner makes the lane suddenly
+                        # wider/narrower when it is the wrong boundary.
+                        self._pending.pop(side, None)
+                        model = None
+                    elif self._accept_jump(side, model):
                         self._forget(side)
                         previous = None
                         reacquired = True
@@ -494,7 +693,7 @@ class LaneTracker:
                     self._pending.pop(side, None)
 
             if model is not None and previous is None and not reacquired:
-                if not self._confirm(side, np.asarray(model, dtype=float), confidence):
+                if not self._near_last_position(side, model) or not self._confirm(side, np.asarray(model, dtype=float), confidence):
                     continue
             elif model is None and previous is None:
                 self._candidate.pop(side, None)
@@ -502,10 +701,10 @@ class LaneTracker:
             if model is None:
                 if previous is not None:
                     self.missing[side] += 1
-                    if self.missing[side] > MAX_MISSING_FRAMES:
+                    if self.missing[side] > self.limit(side):
                         self._forget(side)
                     else:
-                        fade = 1 - self.missing[side] / (MAX_MISSING_FRAMES + 1)
+                        fade = 1 - self.missing[side] / (self.limit(side) + 1)
                         self.confidence[side] = self._peak[side] * fade
                         self.status[side] = "predicted"
                 continue
@@ -523,6 +722,7 @@ class LaneTracker:
             self.missing[side] = 0
             self.confidence[side] = self._peak[side]
             self.status[side] = "detected"
+            self.last_seen[side] = (float(np.polyval(self.models[side], DRAW_BOTTOM)), self.frame)
             detected.add(side)
 
         # A held lane follows its partner when the car drifts sideways.
@@ -591,6 +791,7 @@ def detect_lanes(frame, tracker):
     debug["seeds"] = {side: seed / np.array([width, height, width, height]) for side, seed in seeds.items()}
 
     candidates = {}
+    dash_only = {}
     for side in SIDES:
         seed = seeds.get(side)
         previous = tracker.models.get(side)
@@ -620,6 +821,10 @@ def detect_lanes(frame, tracker):
                 notes.pop(side, None)
                 candidates[side] = curve
                 break
+            if seed_model is not None and side not in dash_only:
+                dash = fit_dash_candidate(points, side, seed_model)
+                if dash is not None:
+                    dash_only[side] = dash
 
         if side not in candidates and previous is not None:
             points = collect_lane_points(mask, previous)
@@ -629,7 +834,27 @@ def detect_lanes(frame, tracker):
                 notes.pop(side, None)
                 candidates[side] = refreshed
 
+    # Curb rejection: paint must stand out from the road on BOTH sides of it.
+    value = smoothed_value(frame)
+    for group in (candidates, dash_only):
+        for side in list(group):
+            model, top, _ = group[side]
+            contrast = paint_contrast(value, model, paint_segments(mask, model, top))
+            needed = MIN_PAINT_CONTRAST_TRACKED if side in tracker.models else MIN_PAINT_CONTRAST
+            if contrast is not None and contrast < needed:
+                notes[side] = f"not paint-like (contrast {contrast:.0f})"
+                del group[side]
+
+    # A dash-only boundary is believed only as one half of a plausible lane pair.
+    used_dash = set()
+    if len(candidates) + len(dash_only.keys() - candidates.keys()) == 2:
+        for side, dash in dash_only.items():
+            if side not in candidates:
+                candidates[side] = dash
+                used_dash.add(side)
     candidates = validate_lane_pair(candidates, tracker, notes)
+    if len(candidates) < 2:
+        candidates = {side: value for side, value in candidates.items() if side not in used_dash}
     debug["candidates"] = candidates
     return candidates
 
@@ -641,30 +866,60 @@ def lane_opacity(tracker, side):
     return 0.3 + 0.7 * tracker.fade(side)
 
 
-def lane_points(tracker, side, width, height):
-    """Pixel polyline for a lane; held lanes are drawn shorter as they fade."""
-    top = tracker.tops[side]
-    if tracker.status.get(side) != "detected":
-        top = DRAW_BOTTOM - (DRAW_BOTTOM - top) * (0.4 + 0.6 * tracker.fade(side))
-    y = np.linspace(top, DRAW_BOTTOM, 40)
+def lane_spans(tracker, side):
+    """The pieces of a lane to draw: painted runs if measured, else one full-length piece."""
+    if side in tracker.segments:
+        return tracker.segments[side]
+    return [None]
+
+
+def lane_points(tracker, side, width, height, span=None):
+    """Pixel polyline for a lane, or for one painted run of it when span=(y0, y1) is given."""
+    if span is None:
+        top = tracker.tops[side]
+        if tracker.status.get(side) != "detected":
+            top = DRAW_BOTTOM - (DRAW_BOTTOM - top) * (0.4 + 0.6 * tracker.fade(side))
+        span = (top, DRAW_BOTTOM)
+    y = np.linspace(span[0], span[1], 40)
     x = np.polyval(tracker.models[side], y)
     return np.column_stack((x * width, y * height)).astype(np.int32).reshape(-1, 1, 2)
 
 
 def draw_lanes(frame, tracker):
+    """Blue paint-following overlay with a faint dark edge so it reads on light and dark road."""
     output = frame.copy()
     height, width = frame.shape[:2]
     scale = width / 1280
+    jobs = []  # (points, opacity) for every painted piece to draw
     for side in SIDES:
         if side not in tracker.models or tracker.confidence[side] < MIN_DRAW_CONFIDENCE:
             continue
-        points = lane_points(tracker, side, width, height)
         opacity = lane_opacity(tracker, side)
-        layer = output if opacity >= 0.99 else output.copy()
-        cv2.polylines(layer, [points], False, LANE_OUTLINE, max(2, round(12 * scale)), cv2.LINE_AA)
-        cv2.polylines(layer, [points], False, LANE_COLOR, max(2, round(7 * scale)), cv2.LINE_AA)
-        if layer is not output:
-            cv2.addWeighted(layer, opacity, output, 1 - opacity, 0, output)
+        for span in lane_spans(tracker, side):
+            jobs.append((lane_points(tracker, side, width, height, span), opacity))
+    if not jobs:
+        return output
+
+    # Work only inside the band of rows the overlay touches: blending a whole
+    # 4K frame just to soften a few thin lines would dominate the frame time.
+    margin = max(2, round(LINE_WIDTH * scale)) + 4
+    rows = np.concatenate([points[:, 0, 1] for points, _ in jobs])
+    top, bottom = max(0, int(rows.min()) - margin), min(height, int(rows.max()) + margin)
+    region = output[top:bottom]
+    jobs = [(points - np.array([0, top], dtype=np.int32), opacity) for points, opacity in jobs]
+
+    # Outline first, blended in lightly: a hard black border looks heavy and
+    # hides the paint it is meant to highlight.
+    shadow = region.copy()
+    for points, _ in jobs:
+        cv2.polylines(shadow, [points], False, LANE_OUTLINE, max(2, round(LINE_WIDTH * scale)) + 2, cv2.LINE_AA)
+    cv2.addWeighted(shadow, OUTLINE_OPACITY, region, 1 - OUTLINE_OPACITY, 0, region)
+
+    for points, opacity in jobs:
+        layer = region if opacity >= 0.99 else region.copy()
+        cv2.polylines(layer, [points], False, LANE_COLOR, max(2, round(LINE_WIDTH * scale)), cv2.LINE_AA)
+        if layer is not region:
+            cv2.addWeighted(layer, opacity, region, 1 - opacity, 0, region)
     return output
 
 
@@ -701,7 +956,7 @@ def draw_debug(frame, tracker):
             status = tracker.status[side]
             text = f"{side.upper()}: {status.upper()} conf {tracker.confidence[side]:.2f}"
             if status == "predicted":
-                text += f" ({tracker.missing[side]}/{MAX_MISSING_FRAMES})"
+                text += f" ({tracker.missing[side]}/{tracker.limit(side)})"
             lines.append((text, status_colors[status]))
             y = np.linspace(tracker.tops[side], DRAW_BOTTOM, 30)
             curve = np.column_stack((np.polyval(tracker.models[side], y) * width, y * height)).astype(np.int32)
@@ -718,6 +973,21 @@ def draw_debug(frame, tracker):
     return output
 
 
+def measure_segments(tracker):
+    """Record, for each tracked lane, where paint is actually visible in this frame."""
+    mask = tracker.debug.get("mask")
+    tracker.segments = {}
+    if mask is None:
+        return
+    for side, model in tracker.models.items():
+        runs = paint_segments(mask, model, ROI_TOP)
+        tracker.segments[side] = runs
+        # Mostly-unpainted lane length means dashes (or occlusion): hold the lane longer.
+        painted = sum(end - start for start, end in runs)
+        if len(runs) >= 2 or (runs and painted < DASHED_PAINTED_FRACTION * (DRAW_BOTTOM - tracker.tops[side])):
+            tracker.dashed[side] = True
+
+
 def process_frame(frame, tracker=None):
     if tracker is None:
         tracker = LaneTracker()
@@ -727,6 +997,7 @@ def process_frame(frame, tracker=None):
         if width > DETECTION_WIDTH else frame
     )
     tracker.update(detect_lanes(working_frame, tracker))
+    measure_segments(tracker)
     # Models use fractions of width/height, so drawing restores original coordinates.
     return draw_lanes(frame, tracker)
 
