@@ -1,0 +1,14 @@
+# Virtual environment and Python build artifacts
+.venv/
+__pycache__/
+*.pyc
+
+# Large driving footage (551 MB, over GitHub's 100 MB limit). Keep it locally for testing.
+test_driving_video.mp4
+*.mp4
+
+# Unused sample image (not referenced by any code or test)
+test_image.jpg
+
+# Scratch output from evaluation runs (labels and sample frames in eval/ ARE tracked)
+eval/output/
