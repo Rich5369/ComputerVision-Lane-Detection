@@ -44,6 +44,20 @@ MIN_PAINT_CONTRAST_TRACKED = 16  # Lower for a lane already tracked, so it does 
 CONTRAST_NEAR = 9  # px at DETECTION_WIDTH: road is sampled from this far from the line...
 CONTRAST_FAR = 16  # ...out to this far, on each side.
 
+# --- Twin stripes (double yellow) ------------------------------------------------
+TWIN_GAP = 0.004  # Gap (fraction of frame width) between pixel columns that splits paint into two stripes.
+
+MAX_END_DISAGREEMENT = 0.004  # Corrections of opposite sign larger than this (fraction of width) mean the pieces were measured inconsistently.
+
+# --- Checking that a drawn lane is still on paint ----------------------------
+CONTRAST_SMOOTHING = 0.15  # Weight of the newest frame in a lane's running paint contrast.
+MIN_TRACKED_CONTRAST = 12  # A lane whose running contrast is below this is a curb, grass or concrete edge: drop it.
+HIDE_CONTRAST = 22  # A lane that once showed real paint is kept but not drawn while its contrast is below this...
+SHOW_CONTRAST = 28  # ...until it climbs back above this (a gap in the edge line at a driveway, then paint again).
+TRUSTED_CONTRAST = 30  # Only a lane that once showed this much contrast may be hidden rather than judged new.
+HIDE_AFTER_FRAMES = 15  # ...and only after it has stayed that low this many frames in a row; thin distant dashes dip briefly.
+MAX_SLOPE_DEVIATION = 1.0  # Pixel slope (dx/dy) a drawn piece may differ from its lane; crossing paint (stop bars) is far off.
+
 # --- Dash / solid segmentation (what the overlay actually draws) ------------
 SEGMENT_BAND = 0.012  # Half-width (fraction of frame width) around the lane curve searched for paint.
 SEGMENT_MIN_LENGTH = 0.010  # Shortest painted run drawn (fraction of frame height).
@@ -341,12 +355,13 @@ def paint_segments(mask, model, top, bottom=None, band=None):
     ]
 
 
-def segment_ends(mask, model, run, band=SEGMENT_BAND_DASHED):
+def segment_ends(mask, model, run, band=SEGMENT_BAND_DASHED, side=None):
     """Where one painted run really sits: its x (fraction of width) at the top and bottom of the run.
 
     The tracked curve smooths over several frames, so in a turn it lags the paint.
     Drawing on the paint itself keeps each dash exactly on its stripe. Falls back
-    to the curve when too little paint is found or the paint is far from it.
+    to the curve when too little paint is found or the paint is far from it, and
+    returns None for a run that does not point along the lane at all.
     """
     height, width = mask.shape[:2]
     rows = np.arange(int(run[0] * height), int(run[1] * height) + 1)
@@ -355,21 +370,46 @@ def segment_ends(mask, model, run, band=SEGMENT_BAND_DASHED):
     ys, xs = [], []
     for row, x in zip(rows, curve_x):
         left, right = max(0, int(x - reach)), min(width, int(x + reach) + 1)
-        found = np.flatnonzero(mask[min(row, height - 1), left:right])
+        found = np.flatnonzero(mask[min(row, height - 1), left:right]) + left
+        found = found[car_side_stripe(found, side, max(2.0, TWIN_GAP * width))]
         if found.size:
             ys.append(row)
-            xs.append(left + float(np.median(found)))
+            xs.append(float(np.median(found)))
     fallback = tuple(float(np.polyval(model, y)) for y in run)
     if len(ys) < 3:
         return fallback
     slope, intercept = np.polyfit(ys, xs, 1)
+    if len(ys) >= 6:
+        # Paint that crosses the lane (a stop bar, a crosswalk edge) runs in another direction.
+        lane_slope = float(np.polyval(np.polyder(model), (run[0] + run[1]) / 2)) * width / height
+        if abs(slope - lane_slope) > MAX_SLOPE_DEVIATION:
+            return None
     ends = tuple(float((slope * y * height + intercept) / width) for y in run)
     if max(abs(end - curve) for end, curve in zip(ends, fallback)) > band:
         return fallback
     return ends
 
 
-def collect_lane_points(mask, guide, loose=False):
+def car_side_stripe(xs, side, gap):
+    """Boolean mask over `xs` keeping, of two stripes side by side (a double line), the one nearest the car.
+
+    A left boundary is the right-hand stripe of a pair and a right boundary the
+    left-hand one. `xs` are pixel columns of paint; the pair is told apart by a gap
+    between columns wider than a stripe is thick. A single stripe keeps everything.
+    """
+    keep = np.ones(xs.shape, dtype=bool)
+    if side is None or xs.size < 2:
+        return keep
+    columns = np.unique(xs)
+    jumps = np.flatnonzero(np.diff(columns) > gap)
+    if jumps.size == 0:
+        return keep
+    if side == "left":
+        return xs > columns[jumps[-1]]
+    return xs <= columns[jumps[0]]
+
+
+def collect_lane_points(mask, guide, loose=False, side=None):
     """Follow a guide upward and keep the center of each narrow marking patch."""
     height, width = mask.shape[:2]
     pixel_y, pixel_x = np.nonzero(mask)
@@ -388,6 +428,10 @@ def collect_lane_points(mask, guide, loose=False):
             & (np.abs(pixel_x - predicted_x) < margin)
         )
         nearby_x = pixel_x[inside]
+        inside_rows = pixel_y[inside]
+        keep = car_side_stripe(nearby_x, side, max(2.0, TWIN_GAP * width))
+        if keep.sum() >= MIN_WINDOW_PIXELS:
+            nearby_x, inside_rows = nearby_x[keep], inside_rows[keep]
         if nearby_x.size < MIN_WINDOW_PIXELS:
             continue
         # Broad blobs are usually cars or sidewalks, not a narrow lane stripe.
@@ -396,7 +440,7 @@ def collect_lane_points(mask, guide, loose=False):
         if np.percentile(nearby_x, 75) - np.percentile(nearby_x, 25) > margin * 0.9:
             continue
         observed_x = float(np.median(nearby_x))
-        observed_y = float(np.median(pixel_y[inside]))
+        observed_y = float(np.median(inside_rows))
         points.append((observed_y / height, observed_x / width, min(nearby_x.size, 100)))
         offset = 0.65 * (observed_x - np.polyval(guide, middle) * width)
     return points
@@ -431,7 +475,7 @@ def fit_lane_curve(mask, side, guide, points=None, notes=None, loose=False):
     height, width = mask.shape[:2]
     aspect = width / height
     if points is None:
-        points = collect_lane_points(mask, guide, loose)
+        points = collect_lane_points(mask, guide, loose, side)
     points = contiguous_from_bottom(points)
 
     if len(points) < 3:
@@ -718,6 +762,10 @@ class LaneTracker:
         # Painted runs per side measured on the current frame: [(y_start, y_end), ...].
         # A side with no entry was not measured, so drawing falls back to the whole curve.
         self.segments: dict[str, list[tuple[float, float]]] = {}
+        self.contrast: dict[str, float] = {}  # Running paint contrast of each tracked lane.
+        self.contrast_peak: dict[str, float] = {}  # What that contrast was while the lane was most trusted.
+        self.low_frames: dict[str, int] = {}  # Consecutive checks a lane's contrast has stayed below HIDE_CONTRAST.
+        self.hidden: dict[str, bool] = {}  # Lane kept but not drawn while its paint is far below its trusted level.
         self.unseen: dict[str, int] = {}  # Consecutive frames a lane showed no paint but kept its last dashes.
         self.ends: dict[str, list[tuple[float, float]]] = {}  # x at each run's (top, bottom), parallel to segments.
         self.frame = 0
@@ -740,7 +788,8 @@ class LaneTracker:
 
     def _forget(self, side):
         for store in (self.models, self.tops, self.missing, self.confidence,
-                      self.status, self.dashed, self._peak, self._pending, self._candidate):
+                      self.status, self.dashed, self._peak, self._pending, self._candidate,
+                      self.contrast, self.contrast_peak, self.hidden, self.low_frames):
             store.pop(side, None)
 
     def _confirm(self, side, model, confidence):
@@ -972,7 +1021,7 @@ def _detect_with_mask(frame, tracker, mask, loose=False):
             continue
 
         for guide in guides:
-            points = collect_lane_points(mask, guide, loose)
+            points = collect_lane_points(mask, guide, loose, side)
             debug["points"][side] = points
             curve = fit_lane_curve(mask, side, guide, points, notes, loose)
             if curve is not None:
@@ -985,7 +1034,7 @@ def _detect_with_mask(frame, tracker, mask, loose=False):
                     dash_only[side] = dash
 
         if side not in candidates and previous is not None:
-            points = collect_lane_points(mask, previous)
+            points = collect_lane_points(mask, previous, side=side)
             refreshed = refresh_from_dashes(points, previous, tracker.tops[side])
             if refreshed is not None:
                 debug["points"][side] = points
@@ -1180,6 +1229,17 @@ def draw_debug(frame, tracker):
     return output
 
 
+def consistent_ends(model, runs, ends):
+    """Are the per-piece paint positions a believable sideways shift of the lane curve?
+
+    A lane that lags the paint in a turn is off by the same direction all along.
+    Pieces that pull in opposite directions were measured on different things
+    (the near and far half of a double line, a neighbouring stripe), so none is trusted.
+    """
+    shifts = [end - float(np.polyval(model, y)) for run, pair in zip(runs, ends) for y, end in zip(run, pair)]
+    return not (shifts and max(shifts) > MAX_END_DISAGREEMENT and min(shifts) < -MAX_END_DISAGREEMENT)
+
+
 def measure_segments(tracker):
     """Record, for each tracked lane, where paint is actually visible in this frame."""
     mask = tracker.debug.get("mask")
@@ -1191,8 +1251,13 @@ def measure_segments(tracker):
     for side, model in tracker.models.items():
         runs = paint_segments(mask, model, ROI_TOP,
                               band=SEGMENT_BAND_DASHED if tracker.dashed.get(side) else None)
+        ends = [segment_ends(mask, model, run, side=side) for run in runs]
+        runs = [run for run, end in zip(runs, ends) if end is not None]
+        ends = [end for end in ends if end is not None]
+        if not consistent_ends(model, runs, ends):
+            ends = [tuple(float(np.polyval(model, y)) for y in run) for run in runs]
         tracker.segments[side] = runs
-        tracker.ends[side] = [segment_ends(mask, model, run) for run in runs]
+        tracker.ends[side] = ends
         if runs:
             tracker.unseen[side] = 0
         elif previous_segments.get(side) and tracker.unseen.get(side, 0) < SEGMENT_HOLD_FRAMES:
@@ -1204,6 +1269,44 @@ def measure_segments(tracker):
         painted = sum(end - start for start, end in runs)
         if len(runs) >= 2 or (runs and painted < DASHED_PAINTED_FRACTION * (DRAW_BOTTOM - tracker.tops[side])):
             tracker.dashed[side] = True
+
+
+def verify_paint(tracker, value):
+    """Drop or hide lanes that are not on real paint.
+
+    Paint is brighter than the road on BOTH sides. A curb face, the edge of a
+    concrete apron or grass is not, and measures near zero. A single frame is noisy
+    (cars, shadows, thin distant dashes), so each lane keeps a running average. A
+    lane near zero is dropped. A lane that was on real paint but stays low for a
+    while (the edge line runs out at a driveway) is kept but not drawn until the
+    paint returns.
+    """
+    for side in list(tracker.models):
+        model = tracker.models[side]
+        contrast = paint_contrast(value, model, tracker.segments.get(side, []))
+        if contrast is None:
+            continue
+        average = tracker.contrast.get(side)
+        average = contrast if average is None else (1 - CONTRAST_SMOOTHING) * average + CONTRAST_SMOOTHING * contrast
+        tracker.contrast[side] = average
+        peak = max(average, tracker.contrast_peak.get(side, average))
+        tracker.contrast_peak[side] = peak
+        if peak >= TRUSTED_CONTRAST:
+            if average >= SHOW_CONTRAST:
+                tracker.low_frames[side] = 0
+                tracker.hidden[side] = False
+            elif average < HIDE_CONTRAST:
+                tracker.low_frames[side] = tracker.low_frames.get(side, 0) + 1
+                if tracker.low_frames[side] >= HIDE_AFTER_FRAMES:
+                    tracker.hidden[side] = True
+        if average < MIN_TRACKED_CONTRAST:
+            tracker._forget(side)
+            tracker.segments.pop(side, None)
+            tracker.ends.pop(side, None)
+            tracker.unseen.pop(side, None)
+        elif tracker.hidden.get(side):
+            tracker.segments[side] = []
+            tracker.ends[side] = []
 
 
 def drop_lanes_on_vegetation(tracker, frame):
@@ -1226,6 +1329,7 @@ def process_frame(frame, tracker=None):
     )
     tracker.update(detect_lanes(working_frame, tracker))
     measure_segments(tracker)
+    verify_paint(tracker, smoothed_value(working_frame))
     drop_lanes_on_vegetation(tracker, working_frame)
     # Models use fractions of width/height, so drawing restores original coordinates.
     return draw_lanes(frame, tracker)

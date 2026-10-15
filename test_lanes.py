@@ -336,6 +336,85 @@ class LaneDetectionTests(unittest.TestCase):
         self.assertFalse(lanes.on_vegetation(asphalt, model, runs))
         self.assertTrue(lanes.on_vegetation(grass, model, runs))
 
+    def test_double_line_keeps_the_stripe_nearest_the_car(self):
+        columns = np.array([100, 101, 102, 110, 111, 112])  # Two stripes, 8 px apart.
+        left_keep = lanes.car_side_stripe(columns, "left", 2.0)
+        right_keep = lanes.car_side_stripe(columns, "right", 2.0)
+        np.testing.assert_array_equal(columns[left_keep], [110, 111, 112])  # Left boundary: the right-hand stripe.
+        np.testing.assert_array_equal(columns[right_keep], [100, 101, 102])  # Right boundary: the left-hand stripe.
+        single = np.array([100, 101, 102, 103])
+        self.assertTrue(lanes.car_side_stripe(single, "left", 2.0).all())  # One stripe is untouched.
+
+    def test_lane_over_a_curb_edge_is_dropped_but_real_paint_is_kept(self):
+        height, width = 540, 960
+        x = int(np.polyval(LEFT, 0.65) * width)
+        road = np.full((height, width), 70, dtype=np.uint8)
+        paint = road.copy()
+        for row in range(int(0.5 * height), int(0.72 * height)):
+            cx = int(np.polyval(LEFT, row / height) * width)
+            paint[row, cx - 2:cx + 3] = 170  # Bright stripe on dark asphalt.
+        curb = np.full((height, width), 150, dtype=np.uint8)  # Concrete on both sides: no contrast.
+
+        def run(image):
+            tracker = lanes.LaneTracker()
+            confirm(tracker, left=LEFT)
+            tracker.segments = {"left": [(0.55, 0.70)]}
+            tracker.ends = {"left": []}
+            for _ in range(40):
+                lanes.verify_paint(tracker, image)
+            return tracker
+
+        self.assertIn("left", run(paint).models)
+        self.assertNotIn("left", run(curb).models)
+
+    def test_lane_is_hidden_when_paint_runs_out_and_returns_with_it(self):
+        height, width = 540, 960
+        tracker = lanes.LaneTracker()
+        confirm(tracker, left=LEFT)
+        road = np.full((height, width), 70, dtype=np.uint8)
+        paint = road.copy()
+        for row in range(int(0.5 * height), int(0.72 * height)):
+            cx = int(np.polyval(LEFT, row / height) * width)
+            paint[row, cx - 2:cx + 3] = 170
+        faint = road.copy()
+        for row in range(int(0.5 * height), int(0.72 * height)):
+            cx = int(np.polyval(LEFT, row / height) * width)
+            faint[row, cx - 2:cx + 3] = 90  # 20 levels brighter than the road: weaker than paint, stronger than nothing.
+
+        def step(image):
+            tracker.segments = {"left": [(0.55, 0.70)]}
+            tracker.ends = {"left": []}
+            lanes.verify_paint(tracker, image)
+
+        for _ in range(30):
+            step(paint)
+        self.assertFalse(tracker.hidden.get("left"))
+        for _ in range(lanes.HIDE_AFTER_FRAMES + 40):  # The running average first has to sink from the paint level.
+            step(faint)
+        self.assertTrue(tracker.hidden.get("left"))
+        self.assertEqual(tracker.segments["left"], [])  # Kept, but nothing is drawn.
+        self.assertIn("left", tracker.models)
+        for _ in range(40):
+            step(paint)
+        self.assertFalse(tracker.hidden.get("left"))  # Paint is back, so the lane is drawn again.
+
+    def test_paint_crossing_the_lane_is_not_drawn_as_part_of_it(self):
+        height, width = 540, 960
+        mask = np.zeros((height, width), dtype=np.uint8)
+        y0, y1 = 0.60, 0.66
+        for row in range(int(y0 * height), int(y1 * height)):
+            x = int(0.2 * width + (row - y0 * height) * 7)  # A flat bar sweeping across the lane.
+            mask[row, x:x + 5] = 255
+        self.assertIsNone(lanes.segment_ends(mask, LEFT, (y0, y1), band=0.4))
+
+    def test_paint_positions_that_pull_in_opposite_directions_are_not_trusted(self):
+        runs = [(0.52, 0.56), (0.57, 0.72)]
+        on_curve = [tuple(np.polyval(LEFT, run)) for run in runs]
+        lagging = [tuple(x + 0.02 for x in pair) for pair in on_curve]  # Same direction everywhere: a lane lagging in a turn.
+        mixed = [tuple(x + 0.01 for x in on_curve[0]), tuple(x - 0.01 for x in on_curve[1])]
+        self.assertTrue(lanes.consistent_ends(LEFT, runs, lagging))
+        self.assertFalse(lanes.consistent_ends(LEFT, runs, mixed))
+
     def test_lone_boundary_cannot_jump_sideways_without_a_partner(self):
         tracker = lanes.LaneTracker()
         confirm(tracker, right=RIGHT)
