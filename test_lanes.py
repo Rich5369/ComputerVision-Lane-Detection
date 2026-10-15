@@ -286,6 +286,56 @@ class LaneDetectionTests(unittest.TestCase):
         tracker.segments = {"left": []}  # Nothing visible this frame: draw nothing.
         np.testing.assert_array_equal(lanes.draw_lanes(frame, tracker), frame)
 
+    def test_gap_between_dashes_is_bridged_but_fainter_than_the_paint(self):
+        tracker = lanes.LaneTracker()
+        confirm(tracker, left=LEFT)
+        frame = np.full((720, 1280, 3), 90, dtype=np.uint8)
+        spans = [(0.60, 0.64), (0.69, 0.72)]
+        tracker.segments = {"left": spans}
+        tracker.ends = {"left": [tuple(np.polyval(LEFT, span)) for span in spans]}
+        drawn = lanes.draw_lanes(frame, tracker)
+        row = int(0.665 * 720)
+        gap_x = int(np.polyval(LEFT, 0.665) * 1280)
+        paint_x = int(np.polyval(LEFT, 0.70) * 1280)
+        self.assertFalse(np.array_equal(drawn[row, gap_x], frame[0, 0]))  # The gap is filled...
+        gap_strength = np.abs(drawn[row, gap_x].astype(int) - 90).sum()
+        paint_strength = np.abs(drawn[int(0.70 * 720), paint_x].astype(int) - 90).sum()
+        self.assertLess(gap_strength, paint_strength)  # ...but reads fainter than real paint.
+
+    def test_overlay_is_not_drawn_on_a_car_ahead(self):
+        tracker = lanes.LaneTracker()
+        confirm(tracker, left=LEFT)
+        frame = np.full((720, 1280, 3), 90, dtype=np.uint8)
+        x = np.polyval(LEFT, 0.62)
+        tracker.vehicles = [(x - 0.05, 0.55, x + 0.05, 0.66)]
+        drawn = lanes.draw_lanes(frame, tracker)
+        row = int(0.62 * 720)
+        self.assertTrue(np.array_equal(drawn[row, int(x * 1280)], frame[0, 0]))  # Under the car: bare.
+        self.assertFalse(np.array_equal(drawn[int(0.70 * 720), int(np.polyval(LEFT, 0.70) * 1280)], frame[0, 0]))
+
+    def test_vehicles_are_found_from_taillight_pairs_not_from_signals_above_the_horizon(self):
+        frame = np.full((540, 960, 3), 90, dtype=np.uint8)
+        cv2.rectangle(frame, (430, 300), (442, 310), (30, 30, 230), -1)  # Left taillight (BGR red).
+        cv2.rectangle(frame, (500, 300), (512, 310), (30, 30, 230), -1)  # Right taillight.
+        cv2.rectangle(frame, (700, 100), (712, 110), (30, 30, 230), -1)  # Red traffic signal in the sky.
+        boxes = lanes.find_vehicles(frame)
+        self.assertEqual(len(boxes), 1)
+        x0, y0, x1, y1 = boxes[0]
+        self.assertLess(x0 * 960, 430)
+        self.assertGreater(x1 * 960, 512)
+        self.assertLess(y0 * 540, 300)
+        self.assertGreater(y1 * 540, 310)
+
+    def test_paint_over_grass_is_flagged_but_paint_over_asphalt_is_not(self):
+        height, width = 540, 960
+        model = np.array([0.0, 0.0, 0.5])
+        runs = [(0.55, 0.70)]
+        asphalt = np.full((height, width, 3), 80, dtype=np.uint8)
+        grass = asphalt.copy()
+        grass[:] = (40, 120, 50)  # BGR green.
+        self.assertFalse(lanes.on_vegetation(asphalt, model, runs))
+        self.assertTrue(lanes.on_vegetation(grass, model, runs))
+
     def test_lone_boundary_cannot_jump_sideways_without_a_partner(self):
         tracker = lanes.LaneTracker()
         confirm(tracker, right=RIGHT)

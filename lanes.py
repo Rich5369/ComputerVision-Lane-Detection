@@ -35,6 +35,7 @@ MIN_BLOB_AREA = 12  # px at DETECTION_WIDTH; smaller specks are noise.
 MIN_BLOB_ELONGATION = 2.2  # Long side / short side; paint stripes are long and thin, car parts are squat.
 MIN_BLOB_ANGLE = 18  # Degrees from horizontal; flatter blobs are stop bars, bumpers or crosswalk bars.
 MAX_FLAT_DASH_LENGTH = 38  # px at DETECTION_WIDTH; short flat slivers are dashes seen at a shallow angle (turns), not bars.
+MIN_TURN_BLOB_ANGLE = 8  # Fallback pass: a line sweeping across the view while turning is flatter than usual.
 MIN_FLAT_DASH_ANGLE = 3  # Degrees from horizontal; anything flatter is a stop bar or bumper edge.
 
 # --- Curb rejection ----------------------------------------------------------
@@ -48,8 +49,21 @@ SEGMENT_BAND = 0.012  # Half-width (fraction of frame width) around the lane cur
 SEGMENT_MIN_LENGTH = 0.010  # Shortest painted run drawn (fraction of frame height).
 SEGMENT_MERGE_GAP = 0.012  # Gaps up to this (fraction of height) inside paint are treated as chips, not dash gaps.
 SEGMENT_BAND_DASHED = 0.024  # Wider search for dashed lanes: while turning, dashes sweep sideways faster than the model follows.
+GAP_OPACITY = 0.55  # Fill between dashes is drawn fainter than the paint itself.
+MAX_GAP_FILL = 0.12  # Longest gap (fraction of frame height) bridged between two dashes.
 SEGMENT_HOLD_FRAMES = 6  # A tracked lane keeps its last drawn dashes this long when none are seen (mask flicker, passing car).
 SEGMENT_PAD = 0.003  # Extend each run slightly so overlay ends sit on the paint edges.
+
+# --- Vehicles ahead (taillight clusters) -------------------------------------
+VEHICLE_TOP = 0.48  # Lights above this are traffic signals and signs, not cars.
+VEHICLE_BOTTOM = 0.72  # Lights below this are reflections on the hood.
+TAILLIGHT_SATURATION = 120
+TAILLIGHT_VALUE = 140
+TAILLIGHT_MIN_PIXELS = 4
+MAX_TAILLIGHT_SIZE = 0.05  # Longest side of one light (fraction of frame width).
+MAX_CAR_WIDTH = 0.3  # Widest car box estimated from lights (fraction of frame width).
+VEHICLE_MARGIN = 0.15  # Extra box size around a red body, as a fraction of its width.
+MAX_VEGETATION = 8  # Green dominance (G minus the larger of R, B) at the line above which it sits on grass.
 
 # --- Searching along a lane --------------------------------------------------
 WINDOW_COUNT = 10
@@ -112,12 +126,17 @@ def make_coordinates(image, line_parameters):
     return np.array([x1, y1, x2, y2])
 
 
-def find_lane_seeds(image, lines):
+def find_lane_seeds(image, lines, loose=False):
     """Pick one straight Hough segment cluster per side as a starting guide."""
     height, width = image.shape[:2]
     fits = {"left": [], "right": []}
     if lines is None:
         return {}
+    # While turning, the line ahead sweeps across the view: allow shallower, wider seeds.
+    min_slope = 0.18 if loose else 0.35
+    span_limit = 0.3 if loose else MAX_SEED_SPAN
+    left_top = (0.3, 0.7) if loose else (0.3, 0.55)
+    right_top = (0.3, 0.7) if loose else (0.45, 0.7)
 
     for line in lines:
         x1, y1, x2, y2 = line.reshape(4)
@@ -125,7 +144,7 @@ def find_lane_seeds(image, lines):
             continue
 
         slope = (y2 - y1) / (x2 - x1)
-        if not 0.35 < abs(slope) < 5:
+        if not min_slope < abs(slope) < 5:
             continue
         intercept = y1 - slope * x1
         bottom_x = (height * DRAW_BOTTOM - intercept) / slope
@@ -133,12 +152,12 @@ def find_lane_seeds(image, lines):
         length = np.hypot(x2 - x1, y2 - y1)
 
         if (slope < 0 and 0.25 * width < bottom_x < 0.5 * width
-                and 0.3 * width < top_x < 0.55 * width
-                and top_x - bottom_x < MAX_SEED_SPAN * width):
+                and left_top[0] * width < top_x < left_top[1] * width
+                and top_x - bottom_x < span_limit * width):
             fits["left"].append((bottom_x, slope, intercept, length))
         elif (slope > 0 and 0.5 * width < bottom_x < 0.84 * width
-              and 0.45 * width < top_x < 0.7 * width
-              and bottom_x - top_x < MAX_SEED_SPAN * width):
+              and right_top[0] * width < top_x < right_top[1] * width
+              and bottom_x - top_x < span_limit * width):
             fits["right"].append((bottom_x, slope, intercept, length))
 
     selected_lines = {}
@@ -276,8 +295,9 @@ def remove_non_stripe_blobs(paint, allow_flat_dashes=False):
         # While turning, far dashes sweep sideways and look flat but stay short; bars are long.
         short_flat_dash = (allow_flat_dashes and max(w, h) <= MAX_FLAT_DASH_LENGTH * scale
                            and angle_from_horizontal >= MIN_FLAT_DASH_ANGLE)
+        min_angle = MIN_TURN_BLOB_ANGLE if allow_flat_dashes else MIN_BLOB_ANGLE
         keep[label] = elongation >= MIN_BLOB_ELONGATION and (
-            angle_from_horizontal >= MIN_BLOB_ANGLE or short_flat_dash)
+            angle_from_horizontal >= min_angle or short_flat_dash)
     return np.where(keep[labels], 255, 0).astype(np.uint8)
 
 
@@ -349,12 +369,12 @@ def segment_ends(mask, model, run, band=SEGMENT_BAND_DASHED):
     return ends
 
 
-def collect_lane_points(mask, guide):
+def collect_lane_points(mask, guide, loose=False):
     """Follow a guide upward and keep the center of each narrow marking patch."""
     height, width = mask.shape[:2]
     pixel_y, pixel_x = np.nonzero(mask)
     window_height = (DRAW_BOTTOM - ROI_TOP) / WINDOW_COUNT
-    margin = WINDOW_MARGIN * width
+    margin = (0.085 if loose else WINDOW_MARGIN) * width
     offset = 0.0
     points = []
 
@@ -397,7 +417,7 @@ def contiguous_from_bottom(points):
     return run
 
 
-def fit_lane_curve(mask, side, guide, points=None, notes=None):
+def fit_lane_curve(mask, side, guide, points=None, notes=None, loose=False):
     """Fit a straight or quadratic boundary through observed marking patches.
 
     Returns (model, top, confidence) or None. When `notes` is a dict, the reason
@@ -411,7 +431,7 @@ def fit_lane_curve(mask, side, guide, points=None, notes=None):
     height, width = mask.shape[:2]
     aspect = width / height
     if points is None:
-        points = collect_lane_points(mask, guide)
+        points = collect_lane_points(mask, guide, loose)
     points = contiguous_from_bottom(points)
 
     if len(points) < 3:
@@ -456,11 +476,12 @@ def fit_lane_curve(mask, side, guide, points=None, notes=None):
         return reject(f"fit too loose ({rms:.3f})")
 
     top_x, bottom_x = np.polyval(model, [ROI_TOP, DRAW_BOTTOM])
+    reach = 0.22 if loose else 0.0
     if side == "left":
-        valid = 0.2 < top_x < 0.64 and 0.12 < bottom_x < 0.52 and bottom_x < top_x - 0.015
+        valid = 0.2 < top_x < 0.64 + reach and 0.12 < bottom_x < 0.52 and bottom_x < top_x - 0.015
     else:
-        valid = 0.36 < top_x < 0.8 and 0.48 < bottom_x < 0.9 and bottom_x > top_x + 0.015
-    if not valid or abs(top_x - bottom_x) > 0.38:
+        valid = 0.36 - reach < top_x < 0.8 and 0.48 < bottom_x < 0.9 and bottom_x > top_x + 0.015
+    if not valid or abs(top_x - bottom_x) > 0.38 + reach:
         return reject("outside the road area")
     if abs(bottom_x - np.polyval(guide, DRAW_BOTTOM)) > 0.04:
         return reject("drifted from guide")
@@ -469,10 +490,11 @@ def fit_lane_curve(mask, side, guide, points=None, notes=None):
     # right going up, right lanes lean left, and neither may be near-flat/vertical.
     middle_y = float(np.mean(y_values))
     pixel_slope = np.polyval(np.polyder(model), middle_y) * aspect
+    max_slope = 5.5 if loose else MAX_LANE_SLOPE
     if side == "left":
-        oriented = -MAX_LANE_SLOPE < pixel_slope < -MIN_LANE_SLOPE
+        oriented = -max_slope < pixel_slope < -MIN_LANE_SLOPE
     else:
-        oriented = MIN_LANE_SLOPE < pixel_slope < MAX_LANE_SLOPE
+        oriented = MIN_LANE_SLOPE < pixel_slope < max_slope
     if not oriented:
         return reject(f"bad orientation ({pixel_slope:.2f})")
 
@@ -519,8 +541,87 @@ def paint_contrast(value, model, runs):
     sides = []
     for direction in (-1, 1):
         columns = np.clip(x[:, None] + direction * offsets[None, :], 0, width - 1)
-        sides.append(value[rows[:, None], columns].mean())
+        # Darkest ring, not the average: the twin of a double yellow line is bright
+        # but the asphalt between and beyond the pair is not.
+        sides.append(value[rows[:, None], columns].mean(axis=0).min())
     return float(line - max(sides))
+
+
+def on_vegetation(frame, model, runs):
+    """True when the painted runs sit on grass: green clearly beats red and blue right at the line."""
+    height, width = frame.shape[:2]
+    if not runs:
+        return False
+    rows = np.concatenate([np.arange(int(start * height), int(end * height)) for start, end in runs])
+    x = (np.polyval(model, rows / height) * width).astype(int)
+    inside = (x > 4) & (x < width - 5)
+    rows, x = rows[inside], x[inside]
+    if len(rows) < 8:
+        return False
+    reach = max(2, round(4 * width / DETECTION_WIDTH))
+    columns = x[:, None] + np.arange(-reach, reach + 1)[None, :]
+    pixels = frame[rows[:, None], columns].astype(np.int16)
+    greenness = pixels[..., 1] - np.maximum(pixels[..., 0], pixels[..., 2])
+    return float(greenness.mean()) > MAX_VEGETATION
+
+
+def find_vehicles(frame):
+    """Boxes (x0, y0, x1, y1 as fractions) for cars ahead, found from their red taillights.
+
+    Each bright saturated red blob is a light. Two lights at about the same height
+    and a car-width apart make one car; a lone light gets a box sized from the
+    light itself. A big solid red patch is a red car and uses its own bounds. Only
+    the road band is searched, so traffic signals and signs above the horizon and
+    hood reflections below are ignored.
+    """
+    height, width = frame.shape[:2]
+    top, bottom = int(height * VEHICLE_TOP), int(height * VEHICLE_BOTTOM)
+    hue, saturation, value = cv2.split(cv2.cvtColor(np.ascontiguousarray(frame[top:bottom]), cv2.COLOR_BGR2HSV))
+    red = (((hue <= 9) | (hue >= 168)) & (saturation >= TAILLIGHT_SATURATION)
+           & (value >= TAILLIGHT_VALUE)).astype(np.uint8) * 255
+    if not red.any():
+        return []
+    scale = width / DETECTION_WIDTH
+    count, _, stats, _ = cv2.connectedComponentsWithStats(red, connectivity=8)
+    boxes, lights = [], []
+    for x, y, w, h, area in stats[1:]:
+        if area < TAILLIGHT_MIN_PIXELS * scale ** 2:
+            continue
+        y += top
+        if area > 0.0015 * width * height and area > 0.35 * w * h:  # A red body.
+            pad = VEHICLE_MARGIN * w / 2
+            boxes.append((x - pad, y - pad, x + w + pad, y + h + pad))
+        elif max(w, h) <= MAX_TAILLIGHT_SIZE * width:  # Larger non-solid red is paint, a sign or part of a body.
+            lights.append((x, y, w, h))
+
+    def car_box(x0, y0, x1, y1):
+        car_width = min(max((x1 - x0) * 1.2, 10 * scale), MAX_CAR_WIDTH * width)
+        centre = (x0 + x1) / 2
+        return centre - 0.5 * car_width, y0 - 0.25 * car_width, centre + 0.5 * car_width, y1 + 0.5 * car_width
+
+    lights.sort()
+    used = set()
+    for i, (xa, ya, wa, ha) in enumerate(lights):
+        if i in used:
+            continue
+        for j in range(i + 1, len(lights)):
+            xb, yb, wb, hb = lights[j]
+            spacing = xb - (xa + wa)
+            if j in used or spacing > 0.1 * width:
+                continue
+            similar = max(wa * ha, wb * hb) <= 3 * min(wa * ha, wb * hb)  # Both lights of one car look alike.
+            if similar and spacing >= max(wa, wb) and abs((ya + ha / 2) - (yb + hb / 2)) <= 0.3 * (spacing + wa + wb):
+                boxes.append(car_box(xa, min(ya, yb), xb + wb, max(ya + ha, yb + hb)))
+                used.update((i, j))
+                break
+    for i, (x, y, w, h) in enumerate(lights):
+        if i not in used and not any(x >= bx0 and x + w <= bx1 and y >= by0 and y + h <= by1
+                                     for bx0, by0, bx1, by1 in boxes):
+            centre = x + w / 2
+            half = max(2.5 * w, 6 * scale)
+            boxes.append(car_box(centre - half, y, centre + half, y + h))
+    return [(max(0.0, x0 / width), max(0.0, y0 / height), min(1.0, x1 / width), min(1.0, y1 / height))
+            for x0, y0, x1, y1 in boxes]
 
 
 def side_geometry_ok(side, model):
@@ -620,6 +721,7 @@ class LaneTracker:
         self.unseen: dict[str, int] = {}  # Consecutive frames a lane showed no paint but kept its last dashes.
         self.ends: dict[str, list[tuple[float, float]]] = {}  # x at each run's (top, bottom), parallel to segments.
         self.frame = 0
+        self.vehicles: list[tuple[float, float, float, float]] = []  # Boxes of cars ahead, as fractions.
         self.last_seen: dict[str, tuple[float, int]] = {}  # side -> (bottom x, frame); survives _forget.
         self.dashed: dict[str, bool] = {}  # Sticky: set once a lane is seen as separate dashes.
         self._peak: dict[str, float] = {}
@@ -808,19 +910,24 @@ def partner_guide(partner_model, lane_width, side):
 
 
 def detect_lanes(frame, tracker):
-    """Find lane candidates; if the strict paint mask yields none, retry with a looser one.
+    """Find lane candidates, trying progressively more forgiving settings until something fits.
 
-    The loose pass picks up dim dashes (turns at dusk) but also more clutter, so it
-    only runs when the strict pass found no lane at all.
+    1. Strict paint mask and normal road geometry.
+    2. Looser paint mask (dim dusk dashes in a turn).
+    3. Looser mask and wider geometry, for a line sweeping across the view in a bend.
+    Each later pass picks up more clutter, so it only runs when the one before found no lane.
     """
+    tracker.vehicles = find_vehicles(frame)  # Used to keep the overlay off cars ahead.
     candidates = _detect_with_mask(frame, tracker, np.asarray(lane_color_mask(frame)))
     if not candidates:
-        candidates = _detect_with_mask(
-            frame, tracker, np.asarray(lane_color_mask(frame, loose=True)))
+        loose_mask = np.asarray(lane_color_mask(frame, loose=True))
+        candidates = _detect_with_mask(frame, tracker, loose_mask)
+        if not candidates:
+            candidates = _detect_with_mask(frame, tracker, loose_mask, loose=True)
     return candidates
 
 
-def _detect_with_mask(frame, tracker, mask):
+def _detect_with_mask(frame, tracker, mask, loose=False):
     height, width = frame.shape[:2]
     roi_area = cv2.contourArea(roi_polygon(width, height))
     density = np.count_nonzero(mask) / roi_area
@@ -838,7 +945,7 @@ def _detect_with_mask(frame, tracker, mask):
         mask, 2, np.pi / 180, max(10, round(HOUGH_VOTES * scale)), np.array([]),
         minLineLength=max(10, round(HOUGH_MIN_LENGTH * scale)), maxLineGap=max(5, round(HOUGH_MAX_GAP * scale)),
     )
-    seeds = find_lane_seeds(frame, segments)
+    seeds = find_lane_seeds(frame, segments, loose)
     debug["seeds"] = {side: seed / np.array([width, height, width, height]) for side, seed in seeds.items()}
 
     candidates = {}
@@ -865,9 +972,9 @@ def _detect_with_mask(frame, tracker, mask):
             continue
 
         for guide in guides:
-            points = collect_lane_points(mask, guide)
+            points = collect_lane_points(mask, guide, loose)
             debug["points"][side] = points
-            curve = fit_lane_curve(mask, side, guide, points, notes)
+            curve = fit_lane_curve(mask, side, guide, points, notes, loose)
             if curve is not None:
                 notes.pop(side, None)
                 candidates[side] = curve
@@ -890,7 +997,12 @@ def _detect_with_mask(frame, tracker, mask):
     for group in (candidates, dash_only):
         for side in list(group):
             model, top, _ = group[side]
-            contrast = paint_contrast(value, model, paint_segments(mask, model, top))
+            runs = paint_segments(mask, model, top)
+            if on_vegetation(frame, model, runs):
+                notes[side] = "on grass"
+                del group[side]
+                continue
+            contrast = paint_contrast(value, model, runs)
             needed = MIN_PAINT_CONTRAST_TRACKED if side in tracker.models else MIN_PAINT_CONTRAST
             if contrast is not None and contrast < needed:
                 notes[side] = f"not paint-like (contrast {contrast:.0f})"
@@ -927,7 +1039,8 @@ def lane_spans(tracker, side):
 def lane_points(tracker, side, width, height, span=None, ends=None):
     """Pixel polyline for a lane, or for one painted run of it when span=(y0, y1) is given.
 
-    `ends` = (x at y0, x at y1) draws that run as a straight piece on the measured paint.
+    `ends` = (x at y0, x at y1) is where the paint really is at the run's ends: the
+    curve is nudged sideways to meet them, so a long curved run keeps its bend.
     """
     if span is None:
         top = tracker.tops[side]
@@ -935,11 +1048,31 @@ def lane_points(tracker, side, width, height, span=None, ends=None):
             top = DRAW_BOTTOM - (DRAW_BOTTOM - top) * (0.4 + 0.6 * tracker.fade(side))
         span = (top, DRAW_BOTTOM)
     y = np.linspace(span[0], span[1], 40)
+    x = np.polyval(tracker.models[side], y)
     if ends is not None:
-        x = np.interp(y, span, ends)
-    else:
-        x = np.polyval(tracker.models[side], y)
+        correction = np.array(ends) - np.polyval(tracker.models[side], span)
+        x = x + np.interp(y, span, correction)
     return np.column_stack((x * width, y * height)).astype(np.int32).reshape(-1, 1, 2)
+
+
+def outside_vehicles(points, vehicles, width, height):
+    """Split a polyline into the pieces that are not inside any car's box."""
+    if not vehicles:
+        return [points]
+    xy = points.reshape(-1, 2)
+    inside = np.zeros(len(xy), dtype=bool)
+    for x0, y0, x1, y1 in vehicles:
+        inside |= ((xy[:, 0] >= x0 * width) & (xy[:, 0] <= x1 * width)
+                   & (xy[:, 1] >= y0 * height) & (xy[:, 1] <= y1 * height))
+    pieces, start = [], None
+    for index, hidden in enumerate(np.append(inside, True)):
+        if not hidden and start is None:
+            start = index
+        elif hidden and start is not None:
+            if index - start >= 2:
+                pieces.append(points[start:index])
+            start = None
+    return pieces
 
 
 def draw_lanes(frame, tracker):
@@ -954,9 +1087,19 @@ def draw_lanes(frame, tracker):
         opacity = lane_opacity(tracker, side)
         spans = lane_spans(tracker, side)
         ends = tracker.ends.get(side)
+        if ends is not None and len(ends) != len(spans):
+            ends = None
         for index, span in enumerate(spans):
-            span_ends = ends[index] if ends is not None and len(ends) == len(spans) else None
+            span_ends = ends[index] if ends is not None else None
             jobs.append((lane_points(tracker, side, width, height, span, span_ends), opacity))
+            # Bridge the gap to the next dash so the lane reads as one continuous line.
+            if ends is not None and index + 1 < len(spans) and span is not None:
+                gap = (span[1], spans[index + 1][0])
+                if 0 < gap[1] - gap[0] <= MAX_GAP_FILL:
+                    jobs.append((lane_points(tracker, side, width, height, gap, (ends[index][1], ends[index + 1][0])),
+                                 opacity * GAP_OPACITY))
+    jobs = [(piece, opacity) for points, opacity in jobs
+            for piece in outside_vehicles(points, tracker.vehicles, width, height)]
     if not jobs:
         return output
 
@@ -1007,6 +1150,10 @@ def draw_debug(frame, tracker):
         y = np.linspace(top, DRAW_BOTTOM, 30)
         curve = np.column_stack((np.polyval(model, y) * width, y * height)).astype(np.int32)
         cv2.polylines(output, [curve.reshape(-1, 1, 2)], False, (255, 0, 255), max(1, round(3 * scale)), cv2.LINE_AA)
+
+    for x0, y0, x1, y1 in tracker.vehicles:
+        cv2.rectangle(output, (int(x0 * width), int(y0 * height)), (int(x1 * width), int(y1 * height)),
+                      (0, 0, 255), max(1, round(2 * scale)))
 
     status_colors = {"detected": (0, 255, 0), "predicted": (0, 165, 255)}
     font_scale = 0.9 * scale
@@ -1059,6 +1206,16 @@ def measure_segments(tracker):
             tracker.dashed[side] = True
 
 
+def drop_lanes_on_vegetation(tracker, frame):
+    """A held or drifting lane can end up over grass; a new candidate is checked for that, so check these too."""
+    for side in list(tracker.models):
+        if on_vegetation(frame, tracker.models[side], tracker.segments.get(side, [])):
+            tracker._forget(side)
+            tracker.segments.pop(side, None)
+            tracker.ends.pop(side, None)
+            tracker.unseen.pop(side, None)
+
+
 def process_frame(frame, tracker=None):
     if tracker is None:
         tracker = LaneTracker()
@@ -1069,6 +1226,7 @@ def process_frame(frame, tracker=None):
     )
     tracker.update(detect_lanes(working_frame, tracker))
     measure_segments(tracker)
+    drop_lanes_on_vegetation(tracker, working_frame)
     # Models use fractions of width/height, so drawing restores original coordinates.
     return draw_lanes(frame, tracker)
 
