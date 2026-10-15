@@ -88,19 +88,20 @@ class LaneDetectionTests(unittest.TestCase):
         capture = Mock()
         capture.isOpened.return_value = True
         capture.get.return_value = 30
-        capture.read.side_effect = [(True, frame), (True, frame)]
+        capture.read.side_effect = [(True, frame)] * 100
 
         with (patch.object(sys, "argv", ["lanes.py"]),
               patch.object(lanes.cv2, "VideoCapture", return_value=capture),
               patch.object(lanes.cv2, "namedWindow"),
               patch.object(lanes.cv2, "resizeWindow"),
-              patch.object(lanes.cv2, "imshow"),
+              patch.object(lanes.cv2, "imshow") as show,
               patch.object(lanes.cv2, "waitKey", return_value=ord("q")),
               patch.object(lanes.cv2, "destroyAllWindows") as close,
               patch.object(lanes, "process_frame", return_value=frame)):
             lanes.main()
 
-        self.assertEqual(capture.read.call_count, 1)
+        self.assertEqual(show.call_count, 1)  # Shown once, then Q ends playback.
+        self.assertLess(capture.read.call_count, 20)  # The reader thread only reads a few frames ahead, then stops.
         capture.release.assert_called_once()
         close.assert_called_once()
 
@@ -110,7 +111,7 @@ class LaneDetectionTests(unittest.TestCase):
             capture = Mock()
             capture.isOpened.return_value = True
             capture.get.return_value = 30
-            capture.read.side_effect = [(True, frame), (True, frame)]
+            capture.read.side_effect = [(True, frame)] * 100
             with (patch.object(sys, "argv", argv),
                   patch.object(lanes.cv2, "VideoCapture", return_value=capture),
                   patch.object(lanes.cv2, "namedWindow"),
@@ -286,21 +287,37 @@ class LaneDetectionTests(unittest.TestCase):
         tracker.segments = {"left": []}  # Nothing visible this frame: draw nothing.
         np.testing.assert_array_equal(lanes.draw_lanes(frame, tracker), frame)
 
-    def test_gap_between_dashes_is_bridged_but_fainter_than_the_paint(self):
+    def _draw_dashes(self, spans, dashed=False):
         tracker = lanes.LaneTracker()
         confirm(tracker, left=LEFT)
         frame = np.full((720, 1280, 3), 90, dtype=np.uint8)
-        spans = [(0.60, 0.64), (0.69, 0.72)]
         tracker.segments = {"left": spans}
         tracker.ends = {"left": [tuple(np.polyval(LEFT, span)) for span in spans]}
-        drawn = lanes.draw_lanes(frame, tracker)
-        row = int(0.665 * 720)
-        gap_x = int(np.polyval(LEFT, 0.665) * 1280)
-        paint_x = int(np.polyval(LEFT, 0.70) * 1280)
-        self.assertFalse(np.array_equal(drawn[row, gap_x], frame[0, 0]))  # The gap is filled...
-        gap_strength = np.abs(drawn[row, gap_x].astype(int) - 90).sum()
-        paint_strength = np.abs(drawn[int(0.70 * 720), paint_x].astype(int) - 90).sum()
-        self.assertLess(gap_strength, paint_strength)  # ...but reads fainter than real paint.
+        tracker.dashed["left"] = dashed
+        return frame, lanes.draw_lanes(frame, tracker)
+
+    def _is_drawn(self, frame, drawn, y):
+        x = int(np.polyval(LEFT, y) * 1280)
+        return not np.array_equal(drawn[int(y * 720), x], frame[0, 0])
+
+    def test_gap_between_dashes_is_closed_as_firmly_as_the_paint(self):
+        frame, drawn = self._draw_dashes([(0.60, 0.64), (0.69, 0.72)])
+        self.assertTrue(self._is_drawn(frame, drawn, 0.665))  # Inside the gap.
+        gap = np.abs(drawn[int(0.665 * 720), int(np.polyval(LEFT, 0.665) * 1280)].astype(int) - 90).sum()
+        paint = np.abs(drawn[int(0.70 * 720), int(np.polyval(LEFT, 0.70) * 1280)].astype(int) - 90).sum()
+        self.assertEqual(gap, paint)  # No fainter than the dash next to it.
+
+    def test_wide_gap_between_dashes_is_closed_too(self):
+        frame, drawn = self._draw_dashes([(0.52, 0.55), (0.69, 0.72)])  # 0.14 of the frame apart.
+        for y in (0.58, 0.62, 0.66):
+            self.assertTrue(self._is_drawn(frame, drawn, y), y)
+
+    def test_dashed_lane_is_continued_past_its_outermost_dashes_but_a_solid_one_is_not(self):
+        spans = [(0.60, 0.63), (0.66, 0.68)]
+        frame, dashed = self._draw_dashes(spans, dashed=True)
+        self.assertTrue(self._is_drawn(frame, dashed, 0.71))  # Below the nearest dash, down toward the car.
+        frame, solid = self._draw_dashes(spans, dashed=False)
+        self.assertFalse(self._is_drawn(frame, solid, 0.71))
 
     def test_overlay_is_not_drawn_on_a_car_ahead(self):
         tracker = lanes.LaneTracker()

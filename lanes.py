@@ -1,4 +1,6 @@
 import argparse
+import queue
+import threading
 import time
 from pathlib import Path
 from tkinter import Tk, filedialog
@@ -16,6 +18,10 @@ ROI_BOTTOM_RIGHT = 0.92
 DRAW_BOTTOM = 0.72  # Lowest point lanes are drawn/fitted (just above the hood).
 SEED_TOP = 0.55
 DETECTION_WIDTH = 960
+DISPLAY_WIDTH = 1280  # Starting size frames are shrunk to; after that it follows the window (see window_width).
+DISPLAY_STEP = 160  # Window widths are rounded to a multiple of this so the size does not change on every pixel of dragging.
+WINDOW_CHECK_FRAMES = 10  # How often the window size is looked at.
+MAX_LAG_FRAMES = 2  # Behind the video clock by more than this, frames are skipped so playback keeps its speed.
 
 # --- Paint detection ---------------------------------------------------------
 TOPHAT_KERNEL = 25  # px at DETECTION_WIDTH; bright shapes narrower than this count as paint.
@@ -63,8 +69,8 @@ SEGMENT_BAND = 0.012  # Half-width (fraction of frame width) around the lane cur
 SEGMENT_MIN_LENGTH = 0.010  # Shortest painted run drawn (fraction of frame height).
 SEGMENT_MERGE_GAP = 0.012  # Gaps up to this (fraction of height) inside paint are treated as chips, not dash gaps.
 SEGMENT_BAND_DASHED = 0.024  # Wider search for dashed lanes: while turning, dashes sweep sideways faster than the model follows.
-GAP_OPACITY = 0.55  # Fill between dashes is drawn fainter than the paint itself.
-MAX_GAP_FILL = 0.12  # Longest gap (fraction of frame height) bridged between two dashes.
+EXTEND_MIN = 0.005  # Shortest stretch (fraction of frame height) worth adding beyond the outermost dash.
+EXTEND_MIN_RUN = 0.02  # A dash must be at least this tall (fraction of frame height) for its direction to be trusted.
 SEGMENT_HOLD_FRAMES = 6  # A tracked lane keeps its last drawn dashes this long when none are seen (mask flicker, passing car).
 SEGMENT_PAD = 0.003  # Extend each run slightly so overlay ends sit on the paint edges.
 
@@ -270,15 +276,19 @@ def lane_color_mask(frame, loose=False):
     paint[top:bottom] = (white | yellow).astype(np.uint8) * 255
     paint = region_of_interest(paint)
 
+    # Everything below only concerns the rows that can hold paint, so work on that band.
+    band = paint[top:bottom]
+
     # Cars, crosswalk bars and pale concrete are thick; stripes are thin. Erase
     # anything thicker than a stripe so only line-like paint remains.
     thick_size = max(5, round(MAX_STRIPE_WIDTH * scale)) | 1
     thick_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thick_size, thick_size))
-    core = cv2.erode(paint, thick_kernel)
+    core = cv2.erode(band, thick_kernel)
     if core.any():
         grown = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thick_size + 8, thick_size + 8)))
-        paint[grown > 0] = 0
-    return remove_non_stripe_blobs(paint, allow_flat_dashes=loose)
+        band[grown > 0] = 0
+    paint[top:bottom] = remove_non_stripe_blobs(band, allow_flat_dashes=loose)
+    return paint
 
 
 def remove_non_stripe_blobs(paint, allow_flat_dashes=False):
@@ -293,25 +303,33 @@ def remove_non_stripe_blobs(paint, allow_flat_dashes=False):
     """
     scale = paint.shape[1] / DETECTION_WIDTH
     count, labels, stats, _ = cv2.connectedComponentsWithStats(paint, connectivity=8)
-    keep = np.zeros(count, dtype=bool)
-    for label in range(1, count):
-        x, y, w, h, area = stats[label]
-        if area < MIN_BLOB_AREA * scale ** 2:
-            continue
-        ys, xs = np.nonzero(labels[y:y + h, x:x + w] == label)
-        if xs.size < 3:
-            continue
-        covariance = np.cov(np.vstack((xs, ys)))
-        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-        long_axis = eigenvectors[:, 1]
-        elongation = np.sqrt(max(eigenvalues[1], 1e-6) / max(eigenvalues[0], 1e-6))
-        angle_from_horizontal = np.degrees(np.arctan2(abs(long_axis[1]), abs(long_axis[0])))
-        # While turning, far dashes sweep sideways and look flat but stay short; bars are long.
-        short_flat_dash = (allow_flat_dashes and max(w, h) <= MAX_FLAT_DASH_LENGTH * scale
-                           and angle_from_horizontal >= MIN_FLAT_DASH_ANGLE)
-        min_angle = MIN_TURN_BLOB_ANGLE if allow_flat_dashes else MIN_BLOB_ANGLE
-        keep[label] = elongation >= MIN_BLOB_ELONGATION and (
-            angle_from_horizontal >= min_angle or short_flat_dash)
+    if count <= 1:
+        return np.zeros_like(paint)
+
+    # Second moments of every blob in one pass (a loop with a covariance per blob is slow).
+    ys, xs = np.nonzero(labels)
+    which = labels[ys, xs]
+    size = np.bincount(which, minlength=count).astype(np.float64)
+    size[size == 0] = 1.0
+    mean_x = np.bincount(which, xs, minlength=count) / size
+    mean_y = np.bincount(which, ys, minlength=count) / size
+    var_x = np.bincount(which, xs.astype(np.float64) ** 2, minlength=count) / size - mean_x ** 2
+    var_y = np.bincount(which, ys.astype(np.float64) ** 2, minlength=count) / size - mean_y ** 2
+    covariance = np.bincount(which, xs.astype(np.float64) * ys, minlength=count) / size - mean_x * mean_y
+    half_trace = (var_x + var_y) / 2
+    spread = np.sqrt(np.maximum(half_trace ** 2 - (var_x * var_y - covariance ** 2), 0))
+    long_variance, short_variance = half_trace + spread, half_trace - spread
+    elongation = np.sqrt(np.maximum(long_variance, 1e-6) / np.maximum(short_variance, 1e-6))
+    angle_from_horizontal = np.abs(np.degrees(0.5 * np.arctan2(2 * covariance, var_x - var_y)))
+
+    width, height, area = stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT], stats[:, cv2.CC_STAT_AREA]
+    # While turning, far dashes sweep sideways and look flat but stay short; bars are long.
+    short_flat_dash = (allow_flat_dashes & (np.maximum(width, height) <= MAX_FLAT_DASH_LENGTH * scale)
+                       & (angle_from_horizontal >= MIN_FLAT_DASH_ANGLE))
+    min_angle = MIN_TURN_BLOB_ANGLE if allow_flat_dashes else MIN_BLOB_ANGLE
+    keep = ((area >= MIN_BLOB_AREA * scale ** 2) & (area >= 3) & (elongation >= MIN_BLOB_ELONGATION)
+            & ((angle_from_horizontal >= min_angle) | short_flat_dash))
+    keep[0] = False
     return np.where(keep[labels], 255, 0).astype(np.uint8)
 
 
@@ -409,10 +427,39 @@ def car_side_stripe(xs, side, gap):
     return xs <= columns[jumps[0]]
 
 
+_PIXEL_CACHE: list = [None, None, {}]  # [mask, (ys, xs), finished searches]: for the last mask searched.
+
+
+def paint_pixels(mask):
+    """Row and column of every paint pixel, listed once per mask.
+
+    Several lane searches run on the same mask per frame, and scanning a whole
+    frame for its few paint pixels is the most expensive step of each search.
+    """
+    if _PIXEL_CACHE[0] is not mask:
+        _PIXEL_CACHE[0] = mask
+        _PIXEL_CACHE[1] = np.nonzero(mask)
+        _PIXEL_CACHE[2] = {}
+    return _PIXEL_CACHE[1]
+
+
 def collect_lane_points(mask, guide, loose=False, side=None):
-    """Follow a guide upward and keep the center of each narrow marking patch."""
+    """Follow a guide upward and keep the center of each narrow marking patch.
+
+    The same search is often asked for twice in a frame (a tracked lane is its own
+    guide for the fit and again for the dash refresh), so finished searches are kept
+    for as long as the mask is the same.
+    """
+    pixel_y, pixel_x = paint_pixels(mask)
+    key = (np.asarray(guide, dtype=float).tobytes(), loose, side)
+    finished = _PIXEL_CACHE[2]
+    if key not in finished:
+        finished[key] = _collect_lane_points(mask, pixel_y, pixel_x, guide, loose, side)
+    return list(finished[key])
+
+
+def _collect_lane_points(mask, pixel_y, pixel_x, guide, loose, side):
     height, width = mask.shape[:2]
-    pixel_y, pixel_x = np.nonzero(mask)
     window_height = (DRAW_BOTTOM - ROI_TOP) / WINDOW_COUNT
     margin = (0.085 if loose else WINDOW_MARGIN) * width
     offset = 0.0
@@ -437,7 +484,8 @@ def collect_lane_points(mask, guide, loose=False, side=None):
         # Broad blobs are usually cars or sidewalks, not a narrow lane stripe.
         if nearby_x.size > MAX_WINDOW_PIXELS * (width / 1280) ** 2:
             continue
-        if np.percentile(nearby_x, 75) - np.percentile(nearby_x, 25) > margin * 0.9:
+        lower, upper = np.percentile(nearby_x, (25, 75))
+        if upper - lower > margin * 0.9:
             continue
         observed_x = float(np.median(nearby_x))
         observed_y = float(np.median(inside_rows))
@@ -552,10 +600,20 @@ def fit_lane_curve(mask, side, guide, points=None, notes=None, loose=False):
     return model, float(np.min(y_values)), float(confidence)
 
 
+_VALUE_CACHE: list = [None, None]  # [frame, its brightness image]: the last frame measured.
+
+
 def smoothed_value(frame):
-    """Brightness (HSV 'V') of the frame, lightly blurred so single noisy pixels don't count."""
-    blue, green, red = cv2.split(frame)
-    return cv2.GaussianBlur(cv2.max(cv2.max(blue, green), red), (5, 5), 0)
+    """Brightness (HSV 'V') of the frame, lightly blurred so single noisy pixels don't count.
+
+    A frame is measured once even though several steps ask for it. The frame is not
+    modified while it is being processed, so the same object means the same pixels.
+    """
+    if _VALUE_CACHE[0] is not frame:
+        blue, green, red = cv2.split(frame)
+        _VALUE_CACHE[0] = frame
+        _VALUE_CACHE[1] = cv2.GaussianBlur(cv2.max(cv2.max(blue, green), red), (5, 5), 0)
+    return _VALUE_CACHE[1]
 
 
 def paint_contrast(value, model, runs):
@@ -1141,12 +1199,28 @@ def draw_lanes(frame, tracker):
         for index, span in enumerate(spans):
             span_ends = ends[index] if ends is not None else None
             jobs.append((lane_points(tracker, side, width, height, span, span_ends), opacity))
-            # Bridge the gap to the next dash so the lane reads as one continuous line.
+            # Close the gap to the next dash so the lane reads as one continuous line.
             if ends is not None and index + 1 < len(spans) and span is not None:
                 gap = (span[1], spans[index + 1][0])
-                if 0 < gap[1] - gap[0] <= MAX_GAP_FILL:
+                if gap[1] > gap[0]:
                     jobs.append((lane_points(tracker, side, width, height, gap, (ends[index][1], ends[index + 1][0])),
-                                 opacity * GAP_OPACITY))
+                                 opacity))
+        if ends is not None and spans and tracker.dashed.get(side):
+            # A dashed lane is also continued past its outermost dashes, as far as it is tracked,
+            # straight on from the dash so the join has no kink.
+            model = tracker.models[side]
+            first, last = spans[0], spans[-1]
+            for piece, anchor_y, anchor_x, run, run_ends in (
+                    ((tracker.tops[side], first[0]), first[0], ends[0][0], first, ends[0]),
+                    ((last[1], DRAW_BOTTOM), last[1], ends[-1][1], last, ends[-1])):
+                if piece[1] - piece[0] < EXTEND_MIN:
+                    continue
+                if run[1] - run[0] >= EXTEND_MIN_RUN:
+                    slope = (run_ends[1] - run_ends[0]) / (run[1] - run[0])
+                else:
+                    slope = float(np.polyval(np.polyder(model), anchor_y))
+                jobs.append((lane_points(tracker, side, width, height, piece,
+                                         tuple(anchor_x + slope * (y - anchor_y) for y in piece)), opacity))
     jobs = [(piece, opacity) for points, opacity in jobs
             for piece in outside_vehicles(points, tracker.vehicles, width, height)]
     if not jobs:
@@ -1335,6 +1409,22 @@ def process_frame(frame, tracker=None):
     return draw_lanes(frame, tracker)
 
 
+def window_width(window_name, source_width, current):
+    """Frame width to decode at: the window's real width, never more than the video has.
+
+    Showing a frame smaller than its window stretches it and looks soft, while
+    decoding at more than the window can show is wasted time.
+    """
+    try:
+        shown = cv2.getWindowImageRect(window_name)[2]
+    except cv2.error:
+        return current
+    if shown <= 0:
+        return current
+    wanted = round(shown / DISPLAY_STEP) * DISPLAY_STEP
+    return int(min(max(wanted, DISPLAY_STEP * 4), source_width))
+
+
 def choose_video():
     root = Tk()
     root.withdraw()
@@ -1376,29 +1466,75 @@ def main():
 
     fps = capture.get(cv2.CAP_PROP_FPS)
     frame_interval = 1 / fps if fps > 0 else 1 / 30
+    is_file = isinstance(source, str)
     tracker = LaneTracker()
     window_name = "Lane detection - Q or Esc to quit"
     debug_name = "Lane debug"
+
+    # Decoding 4K video takes about half a frame interval, so do it (and the shrink to
+    # window size) on another thread while the lanes of the previous frame are found.
+    frames: queue.Queue = queue.Queue(maxsize=4)
+    stop = threading.Event()
+    target_width = [DISPLAY_WIDTH]  # Read by the decoder thread, updated from the window size.
+    source_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or DISPLAY_WIDTH
+
+    def read_frames():
+        try:
+            while not stop.is_set():
+                success, frame = capture.read()
+                if not success:
+                    break
+                frame = np.asarray(frame)
+                height, width = frame.shape[:2]
+                wanted = target_width[0]
+                if width > wanted:
+                    frame = cv2.resize(frame, (wanted, round(height * wanted / width)), interpolation=cv2.INTER_AREA)
+                while not stop.is_set():
+                    try:
+                        frames.put(frame, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            while not stop.is_set():
+                try:
+                    frames.put(None, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    reader = threading.Thread(target=read_frames, daemon=True)
     try:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 1280, 720)
         if args.debug:
             cv2.namedWindow(debug_name, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(debug_name, 1280, 720)
+        reader.start()
+        start = time.perf_counter()
+        index = 0
         while True:
-            frame_start = time.perf_counter()
-            success, frame = capture.read()
-            if not success:
+            frame = frames.get()
+            if frame is None:
                 break
+            due = start + index * frame_interval
+            index += 1
+            late = time.perf_counter() - due
+            if is_file and late > MAX_LAG_FRAMES * frame_interval:
+                continue  # Too far behind the video clock: drop this frame to catch up.
 
-            frame = np.asarray(frame)
+            if index % WINDOW_CHECK_FRAMES == 1:
+                target_width[0] = window_width(window_name, source_width, target_width[0])
             cv2.imshow(window_name, process_frame(frame, tracker))
             if args.debug:
                 cv2.imshow(debug_name, draw_debug(frame, tracker))
-            delay = max(1, round((frame_interval - (time.perf_counter() - frame_start)) * 1000))
+            delay = max(1, round((due + frame_interval - time.perf_counter()) * 1000)) if is_file else 1
             if cv2.waitKey(delay) & 0xFF in (ord("q"), 27):
                 break
     finally:
+        stop.set()
+        if reader.is_alive():
+            reader.join(timeout=2)
         capture.release()
         cv2.destroyAllWindows()
 
