@@ -22,6 +22,7 @@ TOPHAT_KERNEL = 25  # px at DETECTION_WIDTH; bright shapes narrower than this co
 WHITE_CONTRAST = 22  # How much brighter than the nearby road white paint must be (0-255).
 WHITE_MIN_VALUE = 110  # HSV brightness; dim dusk paint is around 130-170.
 WHITE_MAX_SATURATION = 60  # HSV saturation; grass and tinted surfaces are higher.
+WHITE_MAX_SATURATION_LOOSE = 80  # Fallback-pass limit: dim dusk dashes in a turn reach ~65-75.
 YELLOW_HUE = (8, 30)  # OpenCV hue units (0-179).
 YELLOW_MIN_SATURATION = 80
 YELLOW_MIN_VALUE = 110
@@ -33,6 +34,8 @@ MAX_MASK_DENSITY = 0.12  # If this much of the ROI looks like paint, it is clutt
 MIN_BLOB_AREA = 12  # px at DETECTION_WIDTH; smaller specks are noise.
 MIN_BLOB_ELONGATION = 2.2  # Long side / short side; paint stripes are long and thin, car parts are squat.
 MIN_BLOB_ANGLE = 18  # Degrees from horizontal; flatter blobs are stop bars, bumpers or crosswalk bars.
+MAX_FLAT_DASH_LENGTH = 38  # px at DETECTION_WIDTH; short flat slivers are dashes seen at a shallow angle (turns), not bars.
+MIN_FLAT_DASH_ANGLE = 3  # Degrees from horizontal; anything flatter is a stop bar or bumper edge.
 
 # --- Curb rejection ----------------------------------------------------------
 MIN_PAINT_CONTRAST = 24  # V levels (0-255): a new lane's paint must beat the road on both sides by this much.
@@ -44,6 +47,8 @@ CONTRAST_FAR = 16  # ...out to this far, on each side.
 SEGMENT_BAND = 0.012  # Half-width (fraction of frame width) around the lane curve searched for paint.
 SEGMENT_MIN_LENGTH = 0.010  # Shortest painted run drawn (fraction of frame height).
 SEGMENT_MERGE_GAP = 0.012  # Gaps up to this (fraction of height) inside paint are treated as chips, not dash gaps.
+SEGMENT_BAND_DASHED = 0.024  # Wider search for dashed lanes: while turning, dashes sweep sideways faster than the model follows.
+SEGMENT_HOLD_FRAMES = 6  # A tracked lane keeps its last drawn dashes this long when none are seen (mask flicker, passing car).
 SEGMENT_PAD = 0.003  # Extend each run slightly so overlay ends sit on the paint edges.
 
 # --- Searching along a lane --------------------------------------------------
@@ -198,7 +203,7 @@ def line_model(line, width, height):
     return np.array([0.0, slope, x_bottom / width - slope * y_bottom / height])
 
 
-def lane_color_mask(frame):
+def lane_color_mask(frame, loose=False):
     """Mark pixels that look like narrow white or yellow road paint.
 
     White is judged against the road around it (a morphological top-hat), not
@@ -221,7 +226,7 @@ def lane_color_mask(frame):
     reach = max(3, round(NEIGHBOR_DISTANCE * scale))
     brighter_than_both = smooth - np.maximum(np.roll(smooth, reach, axis=1), np.roll(smooth, -reach, axis=1))
 
-    white = ((contrast > WHITE_CONTRAST) & (value > WHITE_MIN_VALUE) & (saturation < WHITE_MAX_SATURATION)
+    white = ((contrast > WHITE_CONTRAST) & (value > WHITE_MIN_VALUE) & (saturation < (WHITE_MAX_SATURATION_LOOSE if loose else WHITE_MAX_SATURATION))
              & (brighter_than_both > ISOLATION_CONTRAST))
     yellow = (
         (hue >= YELLOW_HUE[0]) & (hue <= YELLOW_HUE[1])
@@ -240,10 +245,10 @@ def lane_color_mask(frame):
     if core.any():
         grown = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thick_size + 8, thick_size + 8)))
         paint[grown > 0] = 0
-    return remove_non_stripe_blobs(paint)
+    return remove_non_stripe_blobs(paint, allow_flat_dashes=loose)
 
 
-def remove_non_stripe_blobs(paint):
+def remove_non_stripe_blobs(paint, allow_flat_dashes=False):
     """Keep only connected paint blobs shaped like a lane stripe.
 
     The color/contrast tests only ask "is this pixel bright?". Taillights, plates,
@@ -268,11 +273,15 @@ def remove_non_stripe_blobs(paint):
         long_axis = eigenvectors[:, 1]
         elongation = np.sqrt(max(eigenvalues[1], 1e-6) / max(eigenvalues[0], 1e-6))
         angle_from_horizontal = np.degrees(np.arctan2(abs(long_axis[1]), abs(long_axis[0])))
-        keep[label] = elongation >= MIN_BLOB_ELONGATION and angle_from_horizontal >= MIN_BLOB_ANGLE
+        # While turning, far dashes sweep sideways and look flat but stay short; bars are long.
+        short_flat_dash = (allow_flat_dashes and max(w, h) <= MAX_FLAT_DASH_LENGTH * scale
+                           and angle_from_horizontal >= MIN_FLAT_DASH_ANGLE)
+        keep[label] = elongation >= MIN_BLOB_ELONGATION and (
+            angle_from_horizontal >= MIN_BLOB_ANGLE or short_flat_dash)
     return np.where(keep[labels], 255, 0).astype(np.uint8)
 
 
-def paint_segments(mask, model, top, bottom=None):
+def paint_segments(mask, model, top, bottom=None, band=None):
     """Find the painted runs along a lane curve: one run for solid paint, several for dashes.
 
     Idea: walk down the lane curve row by row and ask "is there paint right on
@@ -288,7 +297,7 @@ def paint_segments(mask, model, top, bottom=None):
     if rows.size == 0:
         return []
     curve_x = np.polyval(model, rows / height) * width
-    band = SEGMENT_BAND * width
+    band = (SEGMENT_BAND if band is None else band) * width
     on_curve = np.zeros(rows.size, dtype=bool)
     for index, (row, x) in enumerate(zip(rows, curve_x)):
         left, right = max(0, int(x - band)), min(width, int(x + band) + 1)
@@ -310,6 +319,34 @@ def paint_segments(mask, model, top, bottom=None):
         (max(top, (start - pad) / height), min(bottom, (end + pad) / height))
         for start, end in merged if (end - start) >= SEGMENT_MIN_LENGTH * height
     ]
+
+
+def segment_ends(mask, model, run, band=SEGMENT_BAND_DASHED):
+    """Where one painted run really sits: its x (fraction of width) at the top and bottom of the run.
+
+    The tracked curve smooths over several frames, so in a turn it lags the paint.
+    Drawing on the paint itself keeps each dash exactly on its stripe. Falls back
+    to the curve when too little paint is found or the paint is far from it.
+    """
+    height, width = mask.shape[:2]
+    rows = np.arange(int(run[0] * height), int(run[1] * height) + 1)
+    curve_x = np.polyval(model, rows / height) * width
+    reach = band * width
+    ys, xs = [], []
+    for row, x in zip(rows, curve_x):
+        left, right = max(0, int(x - reach)), min(width, int(x + reach) + 1)
+        found = np.flatnonzero(mask[min(row, height - 1), left:right])
+        if found.size:
+            ys.append(row)
+            xs.append(left + float(np.median(found)))
+    fallback = tuple(float(np.polyval(model, y)) for y in run)
+    if len(ys) < 3:
+        return fallback
+    slope, intercept = np.polyfit(ys, xs, 1)
+    ends = tuple(float((slope * y * height + intercept) / width) for y in run)
+    if max(abs(end - curve) for end, curve in zip(ends, fallback)) > band:
+        return fallback
+    return ends
 
 
 def collect_lane_points(mask, guide):
@@ -580,6 +617,8 @@ class LaneTracker:
         # Painted runs per side measured on the current frame: [(y_start, y_end), ...].
         # A side with no entry was not measured, so drawing falls back to the whole curve.
         self.segments: dict[str, list[tuple[float, float]]] = {}
+        self.unseen: dict[str, int] = {}  # Consecutive frames a lane showed no paint but kept its last dashes.
+        self.ends: dict[str, list[tuple[float, float]]] = {}  # x at each run's (top, bottom), parallel to segments.
         self.frame = 0
         self.last_seen: dict[str, tuple[float, int]] = {}  # side -> (bottom x, frame); survives _forget.
         self.dashed: dict[str, bool] = {}  # Sticky: set once a lane is seen as separate dashes.
@@ -769,8 +808,20 @@ def partner_guide(partner_model, lane_width, side):
 
 
 def detect_lanes(frame, tracker):
+    """Find lane candidates; if the strict paint mask yields none, retry with a looser one.
+
+    The loose pass picks up dim dashes (turns at dusk) but also more clutter, so it
+    only runs when the strict pass found no lane at all.
+    """
+    candidates = _detect_with_mask(frame, tracker, np.asarray(lane_color_mask(frame)))
+    if not candidates:
+        candidates = _detect_with_mask(
+            frame, tracker, np.asarray(lane_color_mask(frame, loose=True)))
+    return candidates
+
+
+def _detect_with_mask(frame, tracker, mask):
     height, width = frame.shape[:2]
-    mask = np.asarray(lane_color_mask(frame))
     roi_area = cv2.contourArea(roi_polygon(width, height))
     density = np.count_nonzero(mask) / roi_area
     notes: dict[str, str] = {}
@@ -873,15 +924,21 @@ def lane_spans(tracker, side):
     return [None]
 
 
-def lane_points(tracker, side, width, height, span=None):
-    """Pixel polyline for a lane, or for one painted run of it when span=(y0, y1) is given."""
+def lane_points(tracker, side, width, height, span=None, ends=None):
+    """Pixel polyline for a lane, or for one painted run of it when span=(y0, y1) is given.
+
+    `ends` = (x at y0, x at y1) draws that run as a straight piece on the measured paint.
+    """
     if span is None:
         top = tracker.tops[side]
         if tracker.status.get(side) != "detected":
             top = DRAW_BOTTOM - (DRAW_BOTTOM - top) * (0.4 + 0.6 * tracker.fade(side))
         span = (top, DRAW_BOTTOM)
     y = np.linspace(span[0], span[1], 40)
-    x = np.polyval(tracker.models[side], y)
+    if ends is not None:
+        x = np.interp(y, span, ends)
+    else:
+        x = np.polyval(tracker.models[side], y)
     return np.column_stack((x * width, y * height)).astype(np.int32).reshape(-1, 1, 2)
 
 
@@ -895,8 +952,11 @@ def draw_lanes(frame, tracker):
         if side not in tracker.models or tracker.confidence[side] < MIN_DRAW_CONFIDENCE:
             continue
         opacity = lane_opacity(tracker, side)
-        for span in lane_spans(tracker, side):
-            jobs.append((lane_points(tracker, side, width, height, span), opacity))
+        spans = lane_spans(tracker, side)
+        ends = tracker.ends.get(side)
+        for index, span in enumerate(spans):
+            span_ends = ends[index] if ends is not None and len(ends) == len(spans) else None
+            jobs.append((lane_points(tracker, side, width, height, span, span_ends), opacity))
     if not jobs:
         return output
 
@@ -976,12 +1036,23 @@ def draw_debug(frame, tracker):
 def measure_segments(tracker):
     """Record, for each tracked lane, where paint is actually visible in this frame."""
     mask = tracker.debug.get("mask")
+    previous_segments, previous_ends = tracker.segments, tracker.ends
     tracker.segments = {}
+    tracker.ends = {}
     if mask is None:
         return
     for side, model in tracker.models.items():
-        runs = paint_segments(mask, model, ROI_TOP)
+        runs = paint_segments(mask, model, ROI_TOP,
+                              band=SEGMENT_BAND_DASHED if tracker.dashed.get(side) else None)
         tracker.segments[side] = runs
+        tracker.ends[side] = [segment_ends(mask, model, run) for run in runs]
+        if runs:
+            tracker.unseen[side] = 0
+        elif previous_segments.get(side) and tracker.unseen.get(side, 0) < SEGMENT_HOLD_FRAMES:
+            # Nothing visible for a moment: keep the last dashes instead of blinking out.
+            tracker.unseen[side] = tracker.unseen.get(side, 0) + 1
+            tracker.segments[side] = previous_segments[side]
+            tracker.ends[side] = previous_ends.get(side, [])
         # Mostly-unpainted lane length means dashes (or occlusion): hold the lane longer.
         painted = sum(end - start for start, end in runs)
         if len(runs) >= 2 or (runs and painted < DASHED_PAINTED_FRACTION * (DRAW_BOTTOM - tracker.tops[side])):
